@@ -212,6 +212,96 @@ def gemv_mm(a, b, c, M, K):
     return c
 
 
+@libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("mm_splitk"),
+    key=["M", "N", "K", "stride_am", "stride_bk"],
+    reset_to_zero=["C"],
+)
+@triton.jit
+def mm_kernel_splitk(
+    A,
+    B,
+    C,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    grid_n = tl.cdiv(N, BLOCK_N)
+    pid_m = pid // grid_n
+    pid_n = pid % grid_n
+
+    offsets_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offsets_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    total_k_iters = tl.cdiv(K, BLOCK_K)
+    k_per_split = tl.cdiv(total_k_iters, SPLIT_K)
+    k_start = pid_k * k_per_split
+    k_end = min((pid_k + 1) * k_per_split, total_k_iters)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(k_start, k_end):
+        offsets_k = k * BLOCK_K + tl.arange(0, BLOCK_K)
+        a = tl.load(
+            A + offsets_m[:, None] * stride_am + offsets_k[None, :] * stride_ak,
+            mask=(offsets_m[:, None] < M) & (offsets_k[None, :] < K),
+            other=0.0,
+        )
+        b = tl.load(
+            B + offsets_k[:, None] * stride_bk + offsets_n[None, :] * stride_bn,
+            mask=(offsets_k[:, None] < K) & (offsets_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, b, out_dtype=tl.float32, allow_tf32=False)
+
+    c_ptrs = C + offsets_m[:, None] * stride_cm + offsets_n[None, :] * stride_cn
+    mask = (offsets_m < M)[:, None] & (offsets_n < N)[None, :]
+    tl.atomic_add(c_ptrs, acc, mask=mask)
+
+
+def splitk_mm(a, b, c, M, N, K):
+    logger.debug(
+        "GEMS_METAX MM, [mm scenario]: splitk, [shape info]: "
+        "[-, %s, %s, %s](batch, M, N, K)",
+        M,
+        N,
+        K,
+    )
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+        META["SPLIT_K"],
+    )
+    with torch_device_fn.device(a.device):
+        mm_kernel_splitk[grid](
+            a,
+            b,
+            c,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            c.stride(0),
+            c.stride(1),
+        )
+    return c
+
+
 _ordered_datatypes = [torch.float16, torch.bfloat16, torch.float32]
 
 
@@ -281,6 +371,9 @@ def mm(a, b):
     c = torch.empty((M, N), device=device, dtype=c_dtype)
     if N == 1:
         return gemv_mm(a, b, c, M, K)
+    if M < 2048 and N < 2048 and K >= 4096:
+        c.zero_()
+        return splitk_mm(a, b, c, M, N, K)
     return general_mm(a, b, c, M, N, K)
 
 
@@ -299,4 +392,7 @@ def mm_out(a, b, *, out):
     c = out
     if N == 1:
         return gemv_mm(a, b, c, M, K)
+    if M < 2048 and N < 2048 and K >= 4096:
+        c.zero_()
+        return splitk_mm(a, b, c, M, N, K)
     return general_mm(a, b, c, M, N, K)

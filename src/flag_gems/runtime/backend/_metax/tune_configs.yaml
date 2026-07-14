@@ -263,6 +263,47 @@ mm:
     pipeline: "basic"
   num_stages: 3
   num_warps: 4
+mm_splitk:
+- META:
+    BLOCK_M: 16
+    BLOCK_N: 64
+    BLOCK_K: 64
+    SPLIT_K: 4
+    pipeline: "null"
+  num_stages: 3
+  num_warps: 4
+- META:
+    BLOCK_M: 16
+    BLOCK_N: 128
+    BLOCK_K: 64
+    SPLIT_K: 4
+    pipeline: "null"
+  num_stages: 3
+  num_warps: 4
+- META:
+    BLOCK_M: 16
+    BLOCK_N: 64
+    BLOCK_K: 128
+    SPLIT_K: 8
+    pipeline: "null"
+  num_stages: 3
+  num_warps: 4
+- META:
+    BLOCK_M: 16
+    BLOCK_N: 256
+    BLOCK_K: 64
+    SPLIT_K: 4
+    pipeline: "null"
+  num_stages: 3
+  num_warps: 4
+- META:
+    BLOCK_M: 16
+    BLOCK_N: 64
+    BLOCK_K: 256
+    SPLIT_K: 8
+    pipeline: "null"
+  num_stages: 3
+  num_warps: 4
 softmax_non_inner:
 - META:
     TILE_K: 32
