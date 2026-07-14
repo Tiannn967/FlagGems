@@ -152,6 +152,66 @@ def mm_kernel(
         tl.atomic_add(C, acc, mask=mask)
 
 
+@libentry()
+@libtuner(
+    configs=[triton.Config({"BLOCK_M": 32, "BLOCK_K": 256})],
+    key=["M", "K", "stride_am", "stride_bk"],
+)
+@triton.jit
+def gemv_kernel(
+    A,
+    B,
+    C,
+    M,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_cm,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offsets_m < M
+
+    acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for k_start in range(0, K, BLOCK_K):
+        offsets_k = k_start + tl.arange(0, BLOCK_K)
+        mask_k = offsets_k < K
+        a = tl.load(
+            A + offsets_m[:, None] * stride_am + offsets_k[None, :] * stride_ak,
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0,
+        )
+        b = tl.load(B + offsets_k * stride_bk, mask=mask_k, other=0.0)
+        acc += tl.sum(a.to(tl.float32) * b.to(tl.float32)[None, :], axis=1)
+
+    tl.store(C + offsets_m * stride_cm, acc.to(C.dtype.element_ty), mask=mask_m)
+
+
+def gemv_mm(a, b, c, M, K):
+    logger.debug(
+        "GEMS_METAX MM, [mm scenario]: gemv (N=1), [shape info]: [%s, %s, 1](M, K, N)",
+        M,
+        K,
+    )
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]),)
+    with torch_device_fn.device(a.device):
+        gemv_kernel[grid](
+            a,
+            b,
+            c,
+            M,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            c.stride(0),
+        )
+    return c
+
+
 _ordered_datatypes = [torch.float16, torch.bfloat16, torch.float32]
 
 
@@ -169,6 +229,41 @@ def get_higher_dtype(a, b):
             return a
 
 
+def general_mm(a, b, c, M, N, K):
+    dot_out_dtype = tl.float32
+    logger.debug(
+        "GEMS_METAX MM, [mm scenario]: general, [shape info]: "
+        "[-, %s, %s, %s](batch, M, N, K), [A column-major]: %s, [B column-major]: %s",
+        M,
+        N,
+        K,
+        a.stride(0) == 1,
+        b.stride(0) == 1,
+    )
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+        META["SPLIT_K"],
+    )
+    with torch_device_fn.device(a.device):
+        mm_kernel[grid](
+            a,
+            b,
+            c,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            c.stride(0),
+            c.stride(1),
+            dot_out_dtype=dot_out_dtype,
+            GROUP_M=8,
+        )
+    return c
+
+
 def mm(a, b):
     logger.debug("GEMS_METAX MM")
     device = a.device
@@ -184,39 +279,9 @@ def mm(a, b):
     # allocates output
     c_dtype = get_higher_dtype(a.dtype, b.dtype)
     c = torch.empty((M, N), device=device, dtype=c_dtype)
-    dot_out_dtype = tl.float32
-    logger.debug(
-        "GEMS_METAX MM, [mm scenario]: general, [shape info]: "
-        "[-, %s, %s, %s](batch, M, N, K), [A column-major]: %s, [B column-major]: %s",
-        M,
-        N,
-        K,
-        a.stride(0) == 1,
-        b.stride(0) == 1,
-    )
-    # launch kernel
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
-        META["SPLIT_K"],
-    )
-    with torch_device_fn.device(a.device):
-        mm_kernel[grid](
-            a,
-            b,
-            c,
-            M,
-            N,
-            K,
-            a.stride(0),
-            a.stride(1),
-            b.stride(0),
-            b.stride(1),
-            c.stride(0),
-            c.stride(1),
-            dot_out_dtype=dot_out_dtype,
-            GROUP_M=8,
-        )
-    return c
+    if N == 1:
+        return gemv_mm(a, b, c, M, K)
+    return general_mm(a, b, c, M, N, K)
 
 
 def mm_out(a, b, *, out):
@@ -232,36 +297,6 @@ def mm_out(a, b, *, out):
     _, N = b.shape
     # allocates output
     c = out
-    dot_out_dtype = tl.float32
-    logger.debug(
-        "GEMS_METAX MM, [mm scenario]: general, [shape info]: "
-        "[-, %s, %s, %s](batch, M, N, K), [A column-major]: %s, [B column-major]: %s",
-        M,
-        N,
-        K,
-        a.stride(0) == 1,
-        b.stride(0) == 1,
-    )
-    # launch kernel
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
-        META["SPLIT_K"],
-    )
-    with torch_device_fn.device(a.device):
-        mm_kernel[grid](
-            a,
-            b,
-            c,
-            M,
-            N,
-            K,
-            a.stride(0),
-            a.stride(1),
-            b.stride(0),
-            b.stride(1),
-            c.stride(0),
-            c.stride(1),
-            dot_out_dtype=dot_out_dtype,
-            GROUP_M=8,
-        )
-    return c
+    if N == 1:
+        return gemv_mm(a, b, c, M, K)
+    return general_mm(a, b, c, M, N, K)
