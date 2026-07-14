@@ -30,9 +30,15 @@ logger = logging.getLogger(__name__)
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("mm"),
-    key=["M", "N", "K"],
+    key=["M", "N", "K", "stride_am", "stride_bk"],
 )
 @triton.heuristics(runtime.get_heuristic_config("mm"))
+@triton.heuristics(
+    {
+        "EVEN_M": lambda args: args["M"] % args["BLOCK_M"] == 0,
+        "EVEN_N": lambda args: args["N"] % args["BLOCK_N"] == 0,
+    }
+)
 @triton.heuristics(
     {
         "UPGRADE": lambda args: math.ceil(
@@ -79,6 +85,8 @@ def mm_kernel(
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
     EVEN_K: tl.constexpr,
     UPGRADE: tl.constexpr,
     UPGRADE_A_OFFS: tl.constexpr,
@@ -103,16 +111,36 @@ def mm_kernel(
     # do matrix multiplication
     if UPGRADE_A_OFFS:
         rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
-        ram = (tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)).to(tl.int64)
+        if EVEN_M:
+            ram = tl.max_contiguous(tl.multiple_of(rm, BLOCK_M), BLOCK_M).to(
+                tl.int64
+            )
+        else:
+            ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M).to(
+                tl.int64
+            )
     else:
         rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+        if EVEN_M:
+            ram = tl.max_contiguous(tl.multiple_of(rm, BLOCK_M), BLOCK_M)
+        else:
+            ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
     if UPGRADE_B_OFFS:
         rn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
-        rbn = (tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)).to(tl.int64)
+        if EVEN_N:
+            rbn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_N), BLOCK_N).to(
+                tl.int64
+            )
+        else:
+            rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N).to(
+                tl.int64
+            )
     else:
         rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+        if EVEN_N:
+            rbn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_N), BLOCK_N)
+        else:
+            rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
 
     rk = pid_z * BLOCK_K + tl.arange(0, BLOCK_K)
     # pointers
@@ -144,11 +172,15 @@ def mm_kernel(
         rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         C = C + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
-    mask = (rm < M)[:, None] & (rn < N)[None, :]
     # handles write-back with reduction-splitting
     if SPLIT_K == 1:
-        tl.store(C, acc, mask=mask)
+        if EVEN_M and EVEN_N:
+            tl.store(C, acc)
+        else:
+            mask = (rm < M)[:, None] & (rn < N)[None, :]
+            tl.store(C, acc, mask=mask)
     else:
+        mask = (rm < M)[:, None] & (rn < N)[None, :]
         tl.atomic_add(C, acc, mask=mask)
 
 
