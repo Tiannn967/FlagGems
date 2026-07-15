@@ -391,11 +391,17 @@ def gemv_mm(a, b, c, M, K):
     return c
 
 
+def _reset_splitk_output(args, reset_only=False):
+    # Triton benchmarks with positional args; LibTuner resets cached configs by name.
+    c = args["C"] if isinstance(args, dict) else args[2]
+    c.zero_()
+
+
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("mm_splitk"),
     key=["M", "N", "K", "stride_am", "stride_bk"],
-    reset_to_zero=["C"],
+    pre_hook=_reset_splitk_output,
 )
 @triton.jit
 def mm_kernel_splitk(
