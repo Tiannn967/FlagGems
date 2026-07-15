@@ -179,7 +179,6 @@ mm:
     BLOCK_M: 32
     BLOCK_N: 32
     BLOCK_K: 32
-    SPLIT_K: 1
     pipeline: "basic"
   num_stages: 2
   num_warps: 4
@@ -187,7 +186,6 @@ mm:
     BLOCK_M: 64
     BLOCK_N: 64
     BLOCK_K: 32
-    SPLIT_K: 1
     pipeline: "basic"
   num_stages: 2
   num_warps: 4
@@ -195,7 +193,6 @@ mm:
     BLOCK_M: 128
     BLOCK_N: 128
     BLOCK_K: 32
-    SPLIT_K: 1
     pipeline: "basic"
   num_stages: 2
   num_warps: 4
@@ -203,7 +200,6 @@ mm:
     BLOCK_M: 64
     BLOCK_N: 128
     BLOCK_K: 32
-    SPLIT_K: 1
     pipeline: "basic"
   num_stages: 3
   num_warps: 4
@@ -211,7 +207,6 @@ mm:
     BLOCK_M: 128
     BLOCK_N: 64
     BLOCK_K: 32
-    SPLIT_K: 1
     pipeline: "basic"
   num_stages: 3
   num_warps: 4
@@ -219,7 +214,6 @@ mm:
     BLOCK_M: 128
     BLOCK_N: 256
     BLOCK_K: 32
-    SPLIT_K: 1
     pipeline: "basic"
   num_stages: 2
   num_warps: 8
@@ -227,7 +221,6 @@ mm:
     BLOCK_M: 256
     BLOCK_N: 128
     BLOCK_K: 32
-    SPLIT_K: 1
     pipeline: "basic"
   num_stages: 2
   num_warps: 8
@@ -235,7 +228,6 @@ mm:
     BLOCK_M: 64
     BLOCK_N: 32
     BLOCK_K: 32
-    SPLIT_K: 1
     pipeline: "basic"
   num_stages: 3
   num_warps: 4
@@ -243,7 +235,6 @@ mm:
     BLOCK_M: 32
     BLOCK_N: 64
     BLOCK_K: 32
-    SPLIT_K: 1
     pipeline: "basic"
   num_stages: 3
   num_warps: 4
@@ -251,7 +242,6 @@ mm:
     BLOCK_M: 128
     BLOCK_N: 128
     BLOCK_K: 64
-    SPLIT_K: 1
     pipeline: "basic"
   num_stages: 3
   num_warps: 4
@@ -259,7 +249,6 @@ mm:
     BLOCK_M: 64
     BLOCK_N: 64
     BLOCK_K: 64
-    SPLIT_K: 1
     pipeline: "basic"
   num_stages: 3
   num_warps: 4

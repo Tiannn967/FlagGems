@@ -84,7 +84,6 @@ def mm_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
-    SPLIT_K: tl.constexpr,
     EVEN_M: tl.constexpr,
     EVEN_N: tl.constexpr,
     EVEN_K: tl.constexpr,
@@ -96,10 +95,8 @@ def mm_kernel(
     # matrix multiplication
     if UPGRADE:
         pid = ext.program_id(0)
-        pid_z = ext.program_id(1)
     else:
         pid = tl.program_id(0)
-        pid_z = tl.program_id(1)
     grid_m = tl.cdiv(M, BLOCK_M)
     grid_n = tl.cdiv(N, BLOCK_N)
     # re-order program ID for better L2 performance
@@ -142,17 +139,17 @@ def mm_kernel(
         else:
             rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
 
-    rk = pid_z * BLOCK_K + tl.arange(0, BLOCK_K)
+    rk = tl.arange(0, BLOCK_K)
     # pointers
     A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
     B = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn)
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=dot_out_dtype)
-    for k in range(0, tl.cdiv(K, BLOCK_K * SPLIT_K)):
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
         if EVEN_K:
             a = tl.load(A)
             b = tl.load(B)
         else:
-            k_remaining = K - k * (BLOCK_K * SPLIT_K)
+            k_remaining = K - k * BLOCK_K
             _0 = tl.zeros((1, 1), dtype=C.dtype.element_ty)
             a = tl.load(A, mask=rk[None, :] < k_remaining, other=_0)
             b = tl.load(B, mask=rk[:, None] < k_remaining, other=_0)
@@ -160,8 +157,8 @@ def mm_kernel(
             a = a.to(C.dtype.element_ty)
             b = b.to(C.dtype.element_ty)
         acc += tl.dot(a, b, out_dtype=dot_out_dtype, allow_tf32=False)
-        A += BLOCK_K * SPLIT_K * stride_ak
-        B += BLOCK_K * SPLIT_K * stride_bk
+        A += BLOCK_K * stride_ak
+        B += BLOCK_K * stride_bk
     acc = acc.to(C.dtype.element_ty)
     # rematerialize rm and rn to save registers
     if UPGRADE_C_OFFS:
@@ -172,16 +169,11 @@ def mm_kernel(
         rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         C = C + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
-    # handles write-back with reduction-splitting
-    if SPLIT_K == 1:
-        if EVEN_M and EVEN_N:
-            tl.store(C, acc)
-        else:
-            mask = (rm < M)[:, None] & (rn < N)[None, :]
-            tl.store(C, acc, mask=mask)
+    if EVEN_M and EVEN_N:
+        tl.store(C, acc)
     else:
         mask = (rm < M)[:, None] & (rn < N)[None, :]
-        tl.atomic_add(C, acc, mask=mask)
+        tl.store(C, acc, mask=mask)
 
 
 @libentry()
@@ -235,7 +227,6 @@ def mm_kernel_contiguous(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
-    SPLIT_K: tl.constexpr,
     EVEN_M: tl.constexpr,
     EVEN_N: tl.constexpr,
     EVEN_K: tl.constexpr,
@@ -246,10 +237,8 @@ def mm_kernel_contiguous(
 ):
     if UPGRADE:
         pid = ext.program_id(0)
-        pid_z = ext.program_id(1)
     else:
         pid = tl.program_id(0)
-        pid_z = tl.program_id(1)
     grid_m = tl.cdiv(M, BLOCK_M)
     grid_n = tl.cdiv(N, BLOCK_N)
     width = GROUP_M * grid_n
@@ -291,16 +280,16 @@ def mm_kernel_contiguous(
         else:
             rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
 
-    rk = pid_z * BLOCK_K + tl.arange(0, BLOCK_K)
+    rk = tl.arange(0, BLOCK_K)
     A = A + ram[:, None] * K + rk[None, :]
     B = B + rk[:, None] * N + rbn[None, :]
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=dot_out_dtype)
-    for k in range(0, tl.cdiv(K, BLOCK_K * SPLIT_K)):
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
         if EVEN_K:
             a = tl.load(A)
             b = tl.load(B)
         else:
-            k_remaining = K - k * (BLOCK_K * SPLIT_K)
+            k_remaining = K - k * BLOCK_K
             _0 = tl.zeros((1, 1), dtype=C.dtype.element_ty)
             a = tl.load(A, mask=rk[None, :] < k_remaining, other=_0)
             b = tl.load(B, mask=rk[:, None] < k_remaining, other=_0)
@@ -308,8 +297,8 @@ def mm_kernel_contiguous(
             a = a.to(C.dtype.element_ty)
             b = b.to(C.dtype.element_ty)
         acc += tl.dot(a, b, out_dtype=dot_out_dtype, allow_tf32=False)
-        A += BLOCK_K * SPLIT_K
-        B += BLOCK_K * SPLIT_K * N
+        A += BLOCK_K
+        B += BLOCK_K * N
 
     acc = acc.to(C.dtype.element_ty)
     if UPGRADE_C_OFFS:
@@ -320,15 +309,11 @@ def mm_kernel_contiguous(
         rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         C = C + rm[:, None] * N + rn[None, :]
-    if SPLIT_K == 1:
-        if EVEN_M and EVEN_N:
-            tl.store(C, acc)
-        else:
-            mask = (rm < M)[:, None] & (rn < N)[None, :]
-            tl.store(C, acc, mask=mask)
+    if EVEN_M and EVEN_N:
+        tl.store(C, acc)
     else:
         mask = (rm < M)[:, None] & (rn < N)[None, :]
-        tl.atomic_add(C, acc, mask=mask)
+        tl.store(C, acc, mask=mask)
 
 
 @libentry()
@@ -517,7 +502,6 @@ def general_mm(a, b, c, M, N, K):
     )
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
-        META["SPLIT_K"],
     )
     with torch_device_fn.device(a.device):
         if a.is_contiguous() and b.is_contiguous() and c.is_contiguous():
