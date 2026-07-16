@@ -178,146 +178,6 @@ def mm_kernel(
 
 @libentry()
 @libtuner(
-    configs=runtime.get_tuned_config("mm"),
-    key=["M", "N", "K"],
-)
-@triton.heuristics(runtime.get_heuristic_config("mm"))
-@triton.heuristics(
-    {
-        "EVEN_M": lambda args: args["M"] % args["BLOCK_M"] == 0,
-        "EVEN_N": lambda args: args["N"] % args["BLOCK_N"] == 0,
-    }
-)
-@triton.heuristics(
-    {
-        "UPGRADE": lambda args: math.ceil(
-            (args["M"] * args["N"]) / (args["BLOCK_M"] * args["BLOCK_N"])
-        ).bit_length()
-        > 31,
-    }
-)
-@triton.heuristics(
-    {
-        "UPGRADE_A_OFFS": lambda args: math.ceil(args["M"] * args["K"]).bit_length()
-        > 31,
-    }
-)
-@triton.heuristics(
-    {
-        "UPGRADE_B_OFFS": lambda args: math.ceil(args["K"] * args["N"]).bit_length()
-        > 31,
-    }
-)
-@triton.heuristics(
-    {
-        "UPGRADE_C_OFFS": lambda args: math.ceil(args["M"] * args["N"]).bit_length()
-        > 31,
-    }
-)
-@triton.jit
-def mm_kernel_contiguous(
-    A,
-    B,
-    C,
-    M,
-    N,
-    K,
-    dot_out_dtype: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
-    EVEN_M: tl.constexpr,
-    EVEN_N: tl.constexpr,
-    EVEN_K: tl.constexpr,
-    UPGRADE: tl.constexpr,
-    UPGRADE_A_OFFS: tl.constexpr,
-    UPGRADE_B_OFFS: tl.constexpr,
-    UPGRADE_C_OFFS: tl.constexpr,
-):
-    if UPGRADE:
-        pid = ext.program_id(0)
-    else:
-        pid = tl.program_id(0)
-    grid_m = tl.cdiv(M, BLOCK_M)
-    grid_n = tl.cdiv(N, BLOCK_N)
-    width = GROUP_M * grid_n
-    group_id = pid // width
-    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
-    pid_m = group_id * GROUP_M + (pid % group_size)
-    pid_n = (pid % width) // group_size
-
-    if UPGRADE_A_OFFS:
-        rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
-        if EVEN_M:
-            ram = tl.max_contiguous(tl.multiple_of(rm, BLOCK_M), BLOCK_M).to(
-                tl.int64
-            )
-        else:
-            ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M).to(
-                tl.int64
-            )
-    else:
-        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        if EVEN_M:
-            ram = tl.max_contiguous(tl.multiple_of(rm, BLOCK_M), BLOCK_M)
-        else:
-            ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
-    if UPGRADE_B_OFFS:
-        rn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
-        if EVEN_N:
-            rbn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_N), BLOCK_N).to(
-                tl.int64
-            )
-        else:
-            rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N).to(
-                tl.int64
-            )
-    else:
-        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        if EVEN_N:
-            rbn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_N), BLOCK_N)
-        else:
-            rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
-
-    rk = tl.arange(0, BLOCK_K)
-    A = A + ram[:, None] * K + rk[None, :]
-    B = B + rk[:, None] * N + rbn[None, :]
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=dot_out_dtype)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        if EVEN_K:
-            a = tl.load(A)
-            b = tl.load(B)
-        else:
-            k_remaining = K - k * BLOCK_K
-            _0 = tl.zeros((1, 1), dtype=C.dtype.element_ty)
-            a = tl.load(A, mask=rk[None, :] < k_remaining, other=_0)
-            b = tl.load(B, mask=rk[:, None] < k_remaining, other=_0)
-        if a.dtype != b.dtype:
-            a = a.to(C.dtype.element_ty)
-            b = b.to(C.dtype.element_ty)
-        acc += tl.dot(a, b, out_dtype=dot_out_dtype, allow_tf32=False)
-        A += BLOCK_K
-        B += BLOCK_K * N
-
-    acc = acc.to(C.dtype.element_ty)
-    if UPGRADE_C_OFFS:
-        rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
-        rn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
-        C = C + (rm[:, None] * N + rn[None, :]).to(tl.int64)
-    else:
-        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        C = C + rm[:, None] * N + rn[None, :]
-    if EVEN_M and EVEN_N:
-        tl.store(C, acc)
-    else:
-        mask = (rm < M)[:, None] & (rn < N)[None, :]
-        tl.store(C, acc, mask=mask)
-
-
-@libentry()
-@libtuner(
     configs=[triton.Config({"BLOCK_M": 32, "BLOCK_K": 256})],
     key=["M", "K", "stride_am", "stride_bk"],
 )
@@ -504,34 +364,22 @@ def general_mm(a, b, c, M, N, K):
         triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
     )
     with torch_device_fn.device(a.device):
-        if a.is_contiguous() and b.is_contiguous() and c.is_contiguous():
-            mm_kernel_contiguous[grid](
-                a,
-                b,
-                c,
-                M,
-                N,
-                K,
-                dot_out_dtype=dot_out_dtype,
-                GROUP_M=8,
-            )
-        else:
-            mm_kernel[grid](
-                a,
-                b,
-                c,
-                M,
-                N,
-                K,
-                a.stride(0),
-                a.stride(1),
-                b.stride(0),
-                b.stride(1),
-                c.stride(0),
-                c.stride(1),
-                dot_out_dtype=dot_out_dtype,
-                GROUP_M=8,
-            )
+        mm_kernel[grid](
+            a,
+            b,
+            c,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            c.stride(0),
+            c.stride(1),
+            dot_out_dtype=dot_out_dtype,
+            GROUP_M=8,
+        )
     return c
 
 
