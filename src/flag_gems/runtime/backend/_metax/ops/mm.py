@@ -14,6 +14,7 @@
 
 import logging
 import math
+import os
 
 import torch
 import triton
@@ -25,12 +26,18 @@ from flag_gems.utils import libentry, libtuner
 from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
+EXPAND_CONFIG_FILENAME = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "mm_metax_expand.yaml")
+)
 
 
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("mm"),
     key=["M", "N", "K", "stride_am", "stride_bk"],
+    flagtune_op_name="mm",
+    flagtune_expand_op_name="mm",
+    flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
 )
 @triton.heuristics(runtime.get_heuristic_config("mm"))
 @triton.heuristics(
@@ -180,6 +187,9 @@ def mm_kernel(
 @libtuner(
     configs=[triton.Config({"BLOCK_M": 32, "BLOCK_K": 256})],
     key=["M", "K", "stride_am", "stride_bk"],
+    flagtune_op_name="mm",
+    flagtune_expand_op_name="gemv",
+    flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
 )
 @triton.jit
 def gemv_kernel(
@@ -247,6 +257,10 @@ def _reset_splitk_output(args, reset_only=False):
     configs=runtime.get_tuned_config("mm_splitk"),
     key=["M", "N", "K", "stride_am", "stride_bk"],
     pre_hook=_reset_splitk_output,
+    flagtune_op_name="mm",
+    flagtune_expand_op_name="mm_splitk",
+    flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
+    flagtune_pre_hook=_reset_splitk_output,
 )
 @triton.jit
 def mm_kernel_splitk(
