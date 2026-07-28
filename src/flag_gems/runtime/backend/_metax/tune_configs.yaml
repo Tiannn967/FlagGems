@@ -252,6 +252,49 @@ mm:
     pipeline: "basic"
   num_stages: 3
   num_warps: 4
+mm_nn_bf16:
+- META:
+    BLOCK_M: 16
+    BLOCK_N: 32
+    BLOCK_K: 32
+    pipeline: "basic"
+  num_stages: 4
+  num_warps: 2
+- META:
+    BLOCK_M: 16
+    BLOCK_N: 32
+    BLOCK_K: 16
+    pipeline: "basic"
+  num_stages: 4
+  num_warps: 2
+- META:
+    BLOCK_M: 16
+    BLOCK_N: 64
+    BLOCK_K: 32
+    pipeline: "basic"
+  num_stages: 4
+  num_warps: 2
+- META:
+    BLOCK_M: 16
+    BLOCK_N: 64
+    BLOCK_K: 16
+    pipeline: "basic"
+  num_stages: 4
+  num_warps: 2
+- META:
+    BLOCK_M: 64
+    BLOCK_N: 128
+    BLOCK_K: 32
+    pipeline: "basic"
+  num_stages: 4
+  num_warps: 4
+- META:
+    BLOCK_M: 128
+    BLOCK_N: 128
+    BLOCK_K: 32
+    pipeline: "basic"
+  num_stages: 2
+  num_warps: 8
 mm_splitk:
 - META:
     BLOCK_M: 16

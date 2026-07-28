@@ -218,6 +218,27 @@ class TunedConfigLoader(object):
                 for w in ranges["w"]
             ]
 
+        if op_name == "mm_nn_bf16":
+            return [
+                triton.Config(
+                    {
+                        "BLOCK_M": block_m,
+                        "BLOCK_N": block_n,
+                        "BLOCK_K": block_k,
+                        "pipeline": pipeline,
+                    },
+                    num_stages=s,
+                    num_warps=w,
+                    pre_hook=pre_hook,
+                )
+                for block_m in ranges["BLOCK_M"]
+                for block_n in ranges["BLOCK_N"]
+                for block_k in ranges["BLOCK_K"]
+                for pipeline in ranges["PIPELINE"]
+                for s in ranges["s"]
+                for w in ranges["w"]
+            ]
+
         if op_name in ("bmm_sqmma", "addmm_sqmma"):
             return [
                 triton.Config(
@@ -405,6 +426,7 @@ class TunedConfigLoader(object):
                         "BLOCK_N": block_n,
                         "BLOCK_K": block_k,
                         "SPLIT_K": split_k,
+                        "pipeline": pipeline,
                     },
                     num_stages=s,
                     num_warps=w,
@@ -414,6 +436,7 @@ class TunedConfigLoader(object):
                 for block_n in ranges["BLOCK_N"]
                 for block_k in ranges["BLOCK_K"]
                 for split_k in ranges["SPLIT_K"]
+                for pipeline in ranges["PIPELINE"]
                 for s in ranges["s"]
                 for w in ranges["w"]
             ]
@@ -507,6 +530,7 @@ class TunedConfigLoader(object):
             "mm": self._build_single_expand_spec(
                 "mm", expand_yaml_path=self._get_expand_config_path("mm")
             ),
+            "mm_nn_bf16": self._build_single_expand_spec("mm_nn_bf16"),
             "mm_sqmma": self._build_single_expand_spec(
                 "mm_sqmma", yaml_op_name="mm_general_tma"
             ),

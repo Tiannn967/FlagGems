@@ -31,6 +31,37 @@ EXPAND_CONFIG_FILENAME = os.path.normpath(
 )
 
 
+def _mm_shape_recording_enabled():
+    save_dir = os.getenv("GEMS_SAVE_PATH")
+    return bool(
+        save_dir
+        and os.getenv("USE_GEMS_MODE") == "mm"
+        and os.getenv("GEMS_ONCE", "true").lower() == "false"
+    )
+
+
+def _record_mm_shape(func_name, message, *args):
+    if not _mm_shape_recording_enabled():
+        logger.debug(message, *args)
+        return
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if torch.distributed.get_rank() != 0:
+            return
+    elif os.getenv("RANK", os.getenv("LOCAL_RANK", "0")) != "0":
+        return
+
+    save_dir = os.environ["GEMS_SAVE_PATH"]
+    os.makedirs(save_dir, exist_ok=True)
+    log_path = os.path.join(save_dir, "gems-mm.txt")
+    line = f"[DEBUG] {__name__}.{func_name}: {message % args}\n"
+    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, line.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("mm"),
@@ -163,7 +194,13 @@ def mm_kernel(
         if a.dtype != b.dtype:
             a = a.to(C.dtype.element_ty)
             b = b.to(C.dtype.element_ty)
-        acc += tl.dot(a, b, out_dtype=dot_out_dtype, allow_tf32=False)
+        acc = tl.dot(
+            a,
+            b,
+            acc,
+            out_dtype=dot_out_dtype,
+            allow_tf32=False,
+        )
         A += BLOCK_K * stride_ak
         B += BLOCK_K * stride_bk
     acc = acc.to(C.dtype.element_ty)
@@ -181,6 +218,96 @@ def mm_kernel(
     else:
         mask = (rm < M)[:, None] & (rn < N)[None, :]
         tl.store(C, acc, mask=mask)
+
+
+def _prune_mm_nn_bf16_configs(configs, named_args, **kwargs):
+    return [
+        config
+        for config in configs
+        if config.num_warps != 2
+        or (
+            config.kwargs["BLOCK_M"] <= 32
+            and config.kwargs["BLOCK_N"] <= 64
+        )
+    ]
+
+
+@libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("mm_nn_bf16"),
+    key=["M", "N", "K"],
+    prune_configs_by={"early_config_prune": _prune_mm_nn_bf16_configs},
+    flagtune_op_name="mm",
+    flagtune_expand_op_name="mm_nn_bf16",
+    flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
+)
+@triton.heuristics(runtime.get_heuristic_config("mm"))
+@triton.heuristics(
+    {
+        "EVEN_M": lambda args: args["M"] % args["BLOCK_M"] == 0,
+        "EVEN_N": lambda args: args["N"] % args["BLOCK_N"] == 0,
+    }
+)
+@triton.jit
+def mm_kernel_nn_bf16(
+    A,
+    B,
+    C,
+    M,
+    N,
+    K,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    EVEN_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    grid_m = tl.cdiv(M, BLOCK_M)
+    grid_n = tl.cdiv(N, BLOCK_N)
+
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + pid % group_size
+    pid_n = pid % width // group_size
+
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    if EVEN_M:
+        ram = tl.max_contiguous(tl.multiple_of(rm, BLOCK_M), BLOCK_M)
+    else:
+        ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+    if EVEN_N:
+        rbn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_N), BLOCK_N)
+    else:
+        rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+
+    rk = tl.arange(0, BLOCK_K)
+    a_ptrs = A + ram[:, None] * K + rk[None, :]
+    b_ptrs = B + rk[:, None] * N + rbn[None, :]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        if EVEN_K:
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
+        else:
+            k_remaining = K - k * BLOCK_K
+            a = tl.load(a_ptrs, mask=rk[None, :] < k_remaining, other=0.0)
+            b = tl.load(b_ptrs, mask=rk[:, None] < k_remaining, other=0.0)
+        acc = tl.dot(a, b, acc, out_dtype=tl.float32, allow_tf32=False)
+        a_ptrs += BLOCK_K
+        b_ptrs += BLOCK_K * N
+
+    c_ptrs = C + rm[:, None] * N + rn[None, :]
+    result = acc.to(tl.bfloat16)
+    if EVEN_M and EVEN_N:
+        tl.store(c_ptrs, result)
+    else:
+        tl.store(c_ptrs, result, mask=(rm < M)[:, None] & (rn < N)[None, :])
 
 
 @libentry()
@@ -225,7 +352,8 @@ def gemv_kernel(
 
 
 def gemv_mm(a, b, c, M, K):
-    logger.debug(
+    _record_mm_shape(
+        "gemv_mm",
         "GEMS_METAX MM, [mm scenario]: gemv (N=1), [shape info]: [%s, %s, 1](M, K, N)",
         M,
         K,
@@ -260,7 +388,6 @@ def _reset_splitk_output(args, reset_only=False):
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm_splitk",
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
-    flagtune_pre_hook=_reset_splitk_output,
 )
 @triton.jit
 def mm_kernel_splitk(
@@ -317,7 +444,8 @@ def mm_kernel_splitk(
 
 
 def splitk_mm(a, b, c, M, N, K):
-    logger.debug(
+    _record_mm_shape(
+        "splitk_mm",
         "GEMS_METAX MM, [mm scenario]: splitk, [shape info]: "
         "[-, %s, %s, %s](batch, M, N, K)",
         M,
@@ -365,7 +493,8 @@ def get_higher_dtype(a, b):
 
 def general_mm(a, b, c, M, N, K):
     dot_out_dtype = tl.float32
-    logger.debug(
+    _record_mm_shape(
+        "general_mm",
         "GEMS_METAX MM, [mm scenario]: general, [shape info]: "
         "[-, %s, %s, %s](batch, M, N, K), [A column-major]: %s, [B column-major]: %s",
         M,
@@ -397,8 +526,58 @@ def general_mm(a, b, c, M, N, K):
     return c
 
 
+def general_mm_nn_bf16(a, b, c, M, N, K):
+    _record_mm_shape(
+        "general_mm_nn_bf16",
+        "GEMS_METAX MM, [mm scenario]: general_nn_bf16, [shape info]: "
+        "[-, %s, %s, %s](batch, M, N, K)",
+        M,
+        N,
+        K,
+    )
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+    )
+    with torch_device_fn.device(a.device):
+        mm_kernel_nn_bf16[grid](
+            a,
+            b,
+            c,
+            M,
+            N,
+            K,
+            GROUP_M=8,
+        )
+    return c
+
+
+def splitk_mm_scenario(M, N, K):
+    return M < 1024 and N < 1024 and K >= 2048 and M * N < 32768
+
+
+def nn_bf16_mm_scenario(a, b, c, M, N, K):
+    return (
+        M > 0
+        and N > 0
+        and K > 0
+        and a.dtype is torch.bfloat16
+        and b.dtype is torch.bfloat16
+        and c.dtype is torch.bfloat16
+        and a.stride(0) == K
+        and a.stride(1) == 1
+        and b.stride(0) == N
+        and b.stride(1) == 1
+        and c.stride(0) == N
+        and c.stride(1) == 1
+        and M * K < 2**31
+        and K * N < 2**31
+        and M * N < 2**31
+    )
+
+
 def mm(a, b):
-    logger.debug("GEMS_METAX MM")
+    if not _mm_shape_recording_enabled():
+        logger.debug("GEMS_METAX MM")
     device = a.device
     # handle non-contiguous inputs if necessary
     if a.stride(0) > 1 and a.stride(1) > 1:
@@ -414,14 +593,17 @@ def mm(a, b):
     c = torch.empty((M, N), device=device, dtype=c_dtype)
     if N == 1:
         return gemv_mm(a, b, c, M, K)
-    if M < 2048 and N < 2048 and K >= 4096:
+    if splitk_mm_scenario(M, N, K):
         c.zero_()
         return splitk_mm(a, b, c, M, N, K)
+    if nn_bf16_mm_scenario(a, b, c, M, N, K):
+        return general_mm_nn_bf16(a, b, c, M, N, K)
     return general_mm(a, b, c, M, N, K)
 
 
 def mm_out(a, b, *, out):
-    logger.debug("GEMS_METAX MM_OUT")
+    if not _mm_shape_recording_enabled():
+        logger.debug("GEMS_METAX MM_OUT")
     # handle non-contiguous inputs if necessary
     if a.stride(0) > 1 and a.stride(1) > 1:
         a = a.contiguous()
@@ -435,7 +617,9 @@ def mm_out(a, b, *, out):
     c = out
     if N == 1:
         return gemv_mm(a, b, c, M, K)
-    if M < 2048 and N < 2048 and K >= 4096:
+    if splitk_mm_scenario(M, N, K):
         c.zero_()
         return splitk_mm(a, b, c, M, N, K)
+    if nn_bf16_mm_scenario(a, b, c, M, N, K):
+        return general_mm_nn_bf16(a, b, c, M, N, K)
     return general_mm(a, b, c, M, N, K)
