@@ -228,9 +228,7 @@ def mm_kernel(
     if UPGRADE_A_OFFS:
         rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
         if EVEN_M:
-            ram = tl.max_contiguous(tl.multiple_of(rm, BLOCK_M), BLOCK_M).to(
-                tl.int64
-            )
+            ram = tl.max_contiguous(tl.multiple_of(rm, BLOCK_M), BLOCK_M).to(tl.int64)
         else:
             ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M).to(
                 tl.int64
@@ -244,9 +242,7 @@ def mm_kernel(
     if UPGRADE_B_OFFS:
         rn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
         if EVEN_N:
-            rbn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_N), BLOCK_N).to(
-                tl.int64
-            )
+            rbn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_N), BLOCK_N).to(tl.int64)
         else:
             rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N).to(
                 tl.int64
@@ -1303,12 +1299,19 @@ def mm(a, b):
     c_dtype = get_higher_dtype(a.dtype, b.dtype)
     c = torch.empty((M, N), device=device, dtype=c_dtype)
     if N == 1:
+        if _gemv_k_parallel_scenario(M, K):
+            return gemv_mm_k_parallel(a, b, c, M, K)
         return gemv_mm(a, b, c, M, K)
+    two_step_split_k = _select_two_step_split_k(M, N, K)
+    if two_step_split_k is not None:
+        return splitk_mm_two_step(a, b, c, M, N, K, two_step_split_k)
     if splitk_mm_scenario(M, N, K):
         c.zero_()
         return splitk_mm(a, b, c, M, N, K)
     if nn_bf16_mm_scenario(a, b, c, M, N, K):
         return general_mm_nn_bf16(a, b, c, M, N, K)
+    if nt_bf16_mm_scenario(a, b, c, M, N, K):
+        return general_mm_nt_bf16(a, b, c, M, N, K)
     return general_mm(a, b, c, M, N, K)
 
 
@@ -1327,10 +1330,17 @@ def mm_out(a, b, *, out):
     # allocates output
     c = out
     if N == 1:
+        if _gemv_k_parallel_scenario(M, K):
+            return gemv_mm_k_parallel(a, b, c, M, K)
         return gemv_mm(a, b, c, M, K)
+    two_step_split_k = _select_two_step_split_k(M, N, K)
+    if two_step_split_k is not None:
+        return splitk_mm_two_step(a, b, out, M, N, K, two_step_split_k)
     if splitk_mm_scenario(M, N, K):
         c.zero_()
         return splitk_mm(a, b, c, M, N, K)
     if nn_bf16_mm_scenario(a, b, c, M, N, K):
         return general_mm_nn_bf16(a, b, c, M, N, K)
+    if nt_bf16_mm_scenario(a, b, c, M, N, K):
+        return general_mm_nt_bf16(a, b, c, M, N, K)
     return general_mm(a, b, c, M, N, K)
