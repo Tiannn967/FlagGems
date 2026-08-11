@@ -25,6 +25,7 @@ from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry, libtuner
 from flag_gems.utils import triton_lang_extension as ext
+from flag_gems.utils.device_info import get_l2_cache_size, get_sm_count
 
 logger = logging.getLogger(__name__)
 EXPAND_CONFIG_FILENAME = os.path.normpath(
@@ -380,8 +381,97 @@ def mm_kernel_nn_bf16(
 
 @libentry()
 @libtuner(
+    configs=runtime.get_tuned_config("mm_nt_bf16"),
+    key=["M", "N", "K"],
+    prune_configs_by={"early_config_prune": _prune_mm_dense_configs_nt},
+    flagtune_op_name="mm",
+    flagtune_expand_op_name="mm_nt_bf16",
+    flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
+)
+@triton.heuristics(runtime.get_heuristic_config("mm"))
+@triton.heuristics(
+    {
+        "EVEN_M": lambda args: args["M"] % args["BLOCK_M"] == 0,
+        "EVEN_N": lambda args: args["N"] % args["BLOCK_N"] == 0,
+    }
+)
+@triton.jit
+def mm_kernel_nt_bf16(
+    A,
+    B,
+    C,
+    M,
+    N,
+    K,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    EVEN_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    grid_m = tl.cdiv(M, BLOCK_M)
+    grid_n = tl.cdiv(N, BLOCK_N)
+
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + pid % group_size
+    pid_n = pid % width // group_size
+
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    if EVEN_M:
+        ram = tl.max_contiguous(tl.multiple_of(rm, BLOCK_M), BLOCK_M)
+    else:
+        ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+    if EVEN_N:
+        rbn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_N), BLOCK_N)
+    else:
+        rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+
+    rk = tl.arange(0, BLOCK_K)
+    a_ptrs = A + ram[:, None] * K + rk[None, :]
+    b_ptrs = B + rk[:, None] + rbn[None, :] * K
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        if EVEN_K:
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
+        else:
+            k_remaining = K - k * BLOCK_K
+            a = tl.load(a_ptrs, mask=rk[None, :] < k_remaining, other=0.0)
+            b = tl.load(b_ptrs, mask=rk[:, None] < k_remaining, other=0.0)
+        acc = tl.dot(a, b, acc, out_dtype=tl.float32, allow_tf32=False)
+        a_ptrs += BLOCK_K
+        b_ptrs += BLOCK_K
+
+    c_ptrs = C + rm[:, None] * N + rn[None, :]
+    result = acc.to(tl.bfloat16)
+    if EVEN_M and EVEN_N:
+        tl.store(c_ptrs, result)
+    else:
+        tl.store(c_ptrs, result, mask=(rm < M)[:, None] & (rn < N)[None, :])
+
+
+def _prune_gemv_configs(configs, named_args, **kwargs):
+    configs = list(configs)
+    pruned_configs = [
+        config
+        for config in configs
+        if config.kwargs["BLOCK_K"] == 256 and config.num_warps in (4, 8)
+    ]
+    return pruned_configs or configs
+
+
+@libentry()
+@libtuner(
     configs=[triton.Config({"BLOCK_M": 32, "BLOCK_K": 256})],
     key=["M", "K", "stride_am", "stride_bk"],
+    prune_configs_by={"early_config_prune": _prune_gemv_configs},
     flagtune_op_name="mm",
     flagtune_expand_op_name="gemv",
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
@@ -617,6 +707,69 @@ def general_mm_nn_bf16(a, b, c, M, N, K):
             GROUP_M=8,
         )
     return c
+
+
+def general_mm_nt_bf16(a, b, c, M, N, K):
+    _record_mm_shape(
+        "general_mm_nt_bf16",
+        "GEMS_METAX MM, [mm scenario]: general_nt_bf16, [shape info]: "
+        "[-, %s, %s, %s](batch, M, N, K)",
+        M,
+        N,
+        K,
+    )
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+    )
+    with torch_device_fn.device(a.device):
+        mm_kernel_nt_bf16[grid](
+            a,
+            b,
+            c,
+            M,
+            N,
+            K,
+            GROUP_M=8,
+        )
+    return c
+
+
+@functools.lru_cache(maxsize=1)
+def _dense_output_tile_candidates():
+    tile_candidates = set()
+    for config_name in ("mm", "mm_nn_bf16", "mm_nt_bf16"):
+        tile_candidates.update(
+            (config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"])
+            for config in runtime.get_tuned_config(config_name)
+            if "BLOCK_M" in config.kwargs and "BLOCK_N" in config.kwargs
+        )
+
+        expand_config = runtime.get_expand_config(
+            config_name,
+            yaml_path=EXPAND_CONFIG_FILENAME,
+        )
+        if expand_config != -1:
+            ranges = expand_config["ranges"]
+            block_ms = ranges.get("BLOCK_M", ())
+            block_ns = ranges.get("BLOCK_N", ())
+            tile_candidates.update(
+                (block_m, block_n)
+                for block_m in block_ms
+                for block_n in block_ns
+            )
+
+    return tuple(sorted(tile_candidates))
+
+
+def _max_general_mm_programs(M, N):
+    tile_candidates = _dense_output_tile_candidates()
+    if not tile_candidates:
+        return get_sm_count()
+
+    return max(
+        triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
+        for block_m, block_n in tile_candidates
+    )
 
 
 def splitk_mm_scenario(M, N, K):
