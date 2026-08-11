@@ -684,9 +684,52 @@ def gemv_mm_k_parallel(a, b, c, M, K):
 
 
 def _reset_splitk_output(args, reset_only=False):
-    # Triton benchmarks with positional args; LibTuner resets cached configs by name.
     c = args["C"] if isinstance(args, dict) else args[2]
     c.zero_()
+
+
+def _splitk_b_is_transposed(named_args):
+    return named_args.get("stride_bk") == 1
+
+
+def _splitk_nt_config_aborts(config, transposed_b):
+    if not transposed_b:
+        return False
+
+    pipeline = config.kwargs.get("pipeline")
+    block_n = config.kwargs["BLOCK_N"]
+    block_k = config.kwargs["BLOCK_K"]
+
+    if pipeline == "cpasync" and block_k < block_n:
+        return True
+
+    return False
+
+
+def _prune_mm_splitk_configs(configs, named_args, **kwargs):
+    configs = list(configs)
+    transposed_b = _splitk_b_is_transposed(named_args)
+    pruned_configs = [
+        config
+        for config in configs
+        if not _splitk_nt_config_aborts(config, transposed_b)
+    ]
+
+    return pruned_configs or configs
+
+
+def _prune_mm_splitk_two_step_configs(configs, named_args, **kwargs):
+    configs = list(configs)
+    N = named_args["N"]
+    transposed_b = _splitk_b_is_transposed(named_args)
+    block_ns = (16, 32) if N == 16 else (64, 128)
+    pruned_configs = [
+        config
+        for config in configs
+        if not _splitk_nt_config_aborts(config, transposed_b)
+        if config.kwargs["BLOCK_N"] in block_ns
+    ]
+    return pruned_configs or configs
 
 
 @libentry()
@@ -694,6 +737,7 @@ def _reset_splitk_output(args, reset_only=False):
     configs=runtime.get_tuned_config("mm_splitk"),
     key=["M", "N", "K", "stride_am", "stride_bk"],
     pre_hook=_reset_splitk_output,
+    prune_configs_by={"early_config_prune": _prune_mm_splitk_configs},
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm_splitk",
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
@@ -781,6 +825,225 @@ def splitk_mm(a, b, c, M, N, K):
             c.stride(1),
         )
     return c
+
+
+@libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("mm_splitk_two_step"),
+    key=["M", "N", "K", "stride_am", "stride_bk"],
+    prune_configs_by={"early_config_prune": _prune_mm_splitk_two_step_configs},
+    flagtune_op_name="mm",
+    flagtune_expand_op_name="mm_splitk_two_step",
+    flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
+)
+@triton.jit
+def mm_kernel_splitk_partial(
+    A,
+    B,
+    P,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    SPLIT_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    grid_n = tl.cdiv(N, BLOCK_N)
+    pid_m = pid // grid_n
+    pid_n = pid % grid_n
+
+    offsets_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offsets_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    total_k_iters = tl.cdiv(K, BLOCK_K)
+    k_per_split = tl.cdiv(total_k_iters, SPLIT_K)
+    k_start = pid_k * k_per_split
+    k_end = min((pid_k + 1) * k_per_split, total_k_iters)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(k_start, k_end):
+        offsets_k = k * BLOCK_K + tl.arange(0, BLOCK_K)
+        a = tl.load(
+            A + offsets_m[:, None] * stride_am + offsets_k[None, :] * stride_ak,
+            mask=(offsets_m[:, None] < M) & (offsets_k[None, :] < K),
+            other=0.0,
+        )
+        b = tl.load(
+            B + offsets_k[:, None] * stride_bk + offsets_n[None, :] * stride_bn,
+            mask=(offsets_k[:, None] < K) & (offsets_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, b, out_dtype=tl.float32, allow_tf32=False)
+
+    p_ptrs = P + pid_k * M * N + offsets_m[:, None] * N + offsets_n[None, :]
+    mask = (offsets_m < M)[:, None] & (offsets_n < N)[None, :]
+    tl.store(p_ptrs, acc, mask=mask)
+
+
+@libentry()
+@triton.jit
+def mm_kernel_splitk_reduce(
+    P,
+    C,
+    M,
+    N,
+    stride_cm,
+    stride_cn,
+    SPLIT_K: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < M * N
+    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+
+    for split_id in range(0, SPLIT_K):
+        acc += tl.load(P + split_id * M * N + offsets, mask=mask, other=0.0)
+
+    offsets_m = offsets // N
+    offsets_n = offsets % N
+    c_ptrs = C + offsets_m * stride_cm + offsets_n * stride_cn
+    tl.store(c_ptrs, acc, mask=mask)
+
+
+_TWO_STEP_MAX_SPLITS = 16
+_TWO_STEP_MIN_PROFITABLE_SPLITS = 4
+_TWO_STEP_MIN_K_ITERS_PER_SPLIT = 2
+_TWO_STEP_TARGET_SM_NUMERATOR = 3
+_TWO_STEP_TARGET_SM_DENOMINATOR = 4
+_TWO_STEP_WORKSPACE_L2_NUMERATOR = 1
+_TWO_STEP_WORKSPACE_L2_DENOMINATOR = 4
+
+
+@functools.lru_cache(maxsize=1)
+def _two_step_tile_candidates():
+    candidates = {
+        (
+            config.kwargs["BLOCK_M"],
+            config.kwargs["BLOCK_N"],
+            config.kwargs["BLOCK_K"],
+        )
+        for config in runtime.get_tuned_config("mm_splitk_two_step")
+    }
+
+    expand_config = runtime.get_expand_config(
+        "mm_splitk_two_step",
+        yaml_path=EXPAND_CONFIG_FILENAME,
+    )
+    if expand_config != -1:
+        ranges = expand_config["ranges"]
+        candidates.update(
+            (block_m, block_n, block_k)
+            for block_m in ranges.get("BLOCK_M", ())
+            for block_n in ranges.get("BLOCK_N", ())
+            for block_k in ranges.get("BLOCK_K", ())
+        )
+
+    return tuple(sorted(candidates))
+
+
+def _two_step_reference_tile(N):
+    allowed_block_ns = (16, 32) if N == 16 else (64, 128)
+    candidates = tuple(
+        candidate
+        for candidate in _two_step_tile_candidates()
+        if candidate[1] in allowed_block_ns
+    )
+    if not candidates:
+        return None
+
+    return max(
+        candidates,
+        key=lambda tile: (tile[0] * tile[1], tile[0], tile[1], tile[2]),
+    )
+
+
+def _two_step_split_k(M, N, K):
+    reference_tile = _two_step_reference_tile(N)
+    if reference_tile is None:
+        return 1, 0
+
+    block_m, block_n, block_k = reference_tile
+    output_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
+    target_programs = max(
+        1,
+        get_sm_count()
+        * _TWO_STEP_TARGET_SM_NUMERATOR
+        // _TWO_STEP_TARGET_SM_DENOMINATOR,
+    )
+
+    required_splits = triton.cdiv(target_programs, output_tiles)
+    occupancy_split_k = _ceil_power_of_two(required_splits)
+
+    k_iters = triton.cdiv(K, block_k)
+    max_k_split = _floor_power_of_two(
+        k_iters // _TWO_STEP_MIN_K_ITERS_PER_SPLIT
+    )
+    split_k = min(
+        occupancy_split_k,
+        max_k_split,
+        _TWO_STEP_MAX_SPLITS,
+    )
+    return max(1, split_k), output_tiles
+
+
+def _launch_splitk_mm_two_step(a, b, c, M, N, K, split_k):
+    partials = torch.empty((split_k, M, N), device=a.device, dtype=torch.float32)
+    partial_grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+        split_k,
+    )
+    reduce_block_size = 256
+    reduce_grid = (triton.cdiv(M * N, reduce_block_size),)
+
+    with torch_device_fn.device(a.device):
+        mm_kernel_splitk_partial[partial_grid](
+            a,
+            b,
+            partials,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            SPLIT_K=split_k,
+        )
+        mm_kernel_splitk_reduce[reduce_grid](
+            partials,
+            c,
+            M,
+            N,
+            c.stride(0),
+            c.stride(1),
+            SPLIT_K=split_k,
+            BLOCK_SIZE=reduce_block_size,
+            num_warps=4,
+        )
+    return c
+
+
+def splitk_mm_two_step(a, b, c, M, N, K, split_k=None):
+    if split_k is None:
+        split_k, _ = _two_step_split_k(M, N, K)
+    _record_mm_shape(
+        "splitk_mm_two_step",
+        "GEMS_METAX MM, [mm scenario]: splitk_two_step, [shape info]: "
+        "[-, %s, %s, %s](batch, M, N, K), [split_k]: %s",
+        M,
+        N,
+        K,
+        split_k,
+    )
+    return _launch_splitk_mm_two_step(a, b, c, M, N, K, split_k)
 
 
 _ordered_datatypes = [torch.float16, torch.bfloat16, torch.float32]
@@ -924,7 +1187,56 @@ def _max_general_mm_programs(M, N):
 
 
 def splitk_mm_scenario(M, N, K):
-    return M < 1024 and N < 1024 and K >= 2048 and M * N < 32768
+    if K < 2048:
+        return False
+
+    max_general_programs = _max_general_mm_programs(M, N)
+    parallelism_budget = max(1, get_sm_count() * 3 // 4)
+
+    atomic_working_set = M * N * 4
+    atomic_l2_budget = max(1, get_l2_cache_size() // 32)
+
+    return (
+        max_general_programs <= parallelism_budget
+        and atomic_working_set <= atomic_l2_budget
+    )
+
+
+def _splitk_mm_two_step_scenario(M, N, K):
+    if K < 2048:
+        return False
+
+    if N != 256:
+        return False
+
+    split_k, output_tiles = _two_step_split_k(M, N, K)
+    target_programs = max(
+        1,
+        get_sm_count()
+        * _TWO_STEP_TARGET_SM_NUMERATOR
+        // _TWO_STEP_TARGET_SM_DENOMINATOR,
+    )
+
+    if output_tiles * _TWO_STEP_MIN_PROFITABLE_SPLITS > target_programs:
+        return False
+    if split_k < _TWO_STEP_MIN_PROFITABLE_SPLITS:
+        return False
+
+    workspace_bytes = split_k * M * N * torch.float32.itemsize
+    workspace_budget = max(
+        1,
+        get_l2_cache_size()
+        * _TWO_STEP_WORKSPACE_L2_NUMERATOR
+        // _TWO_STEP_WORKSPACE_L2_DENOMINATOR,
+    )
+    if workspace_bytes > workspace_budget:
+        return False
+
+    return True
+
+
+def _gemv_k_parallel_scenario(M, K):
+    return K >= 2048 and _gemv_k_parallel_split_k(M, K) > 1
 
 
 def nn_bf16_mm_scenario(a, b, c, M, N, K):
@@ -945,6 +1257,33 @@ def nn_bf16_mm_scenario(a, b, c, M, N, K):
         and K * N < 2**31
         and M * N < 2**31
     )
+
+
+def nt_bf16_mm_scenario(a, b, c, M, N, K):
+    return (
+        M > 0
+        and N > 0
+        and K > 0
+        and a.dtype is torch.bfloat16
+        and b.dtype is torch.bfloat16
+        and c.dtype is torch.bfloat16
+        and a.stride(0) == K
+        and a.stride(1) == 1
+        and b.stride(0) == 1
+        and b.stride(1) == K
+        and c.stride(0) == N
+        and c.stride(1) == 1
+        and M * K < 2**31
+        and K * N < 2**31
+        and M * N < 2**31
+    )
+
+
+def _select_two_step_split_k(M, N, K):
+    if _splitk_mm_two_step_scenario(M, N, K):
+        split_k, _ = _two_step_split_k(M, N, K)
+        return split_k
+    return None
 
 
 def mm(a, b):
