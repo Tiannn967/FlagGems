@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import logging
 import math
 import os
@@ -62,10 +63,89 @@ def _record_mm_shape(func_name, message, *args):
         os.close(fd)
 
 
+def _prune_mm_dense_configs(configs, named_args, transposed_b=False, **kwargs):
+    configs = list(configs)
+    M = named_args["M"]
+    N = named_args["N"]
+    K = named_args["K"]
+    pruned_configs = []
+
+    for config in configs:
+        block_m = config.kwargs["BLOCK_M"]
+        block_n = config.kwargs["BLOCK_N"]
+        block_k = config.kwargs["BLOCK_K"]
+        pipeline = config.kwargs["pipeline"]
+        scenario = config.kwargs.get("scenario", "")
+        warps = config.num_warps
+        stages = config.num_stages
+
+        if scenario == "fullstage" and not (
+            block_m == 256
+            and block_n == 256
+            and block_k == 32
+            and pipeline == "basic"
+            and stages == 2
+            and warps == 8
+        ):
+            continue
+
+        if block_k == 128:
+            if block_m > 128 or block_n > 128 or pipeline != "cpasync":
+                continue
+
+        if (
+            pipeline == "cpasync"
+            and block_k >= 64
+            and (block_m == 128 or block_n == 128)
+        ):
+            continue
+
+        if (
+            transposed_b
+            and pipeline == "cpasync"
+            and block_k == 16
+            and block_m == 16
+            and block_n == 256
+            and warps >= 4
+        ):
+            continue
+
+        if transposed_b and K % block_k != 0 and block_m == 256 and block_n == 256:
+            continue
+
+        if (block_m == 128 or block_n == 128) and pipeline == "basic":
+            stage_bytes = (block_m + block_n) * block_k * 2 * stages
+            if stage_bytes > 64 * 1024:
+                continue
+
+        if M >= 1024 and N >= 128:
+            if block_m not in (64, 128, 256) or block_n not in (64, 128, 256):
+                continue
+            if warps not in (4, 8):
+                continue
+        else:
+            if block_m == 128 or warps == 8:
+                continue
+            if N <= 64 and (block_m > 64 or block_n > 64):
+                continue
+            if warps == 2 and not (block_m <= 32 and block_n <= 64):
+                continue
+
+        pruned_configs.append(config)
+
+    return pruned_configs or configs
+
+
+_prune_mm_dense_configs_nt = functools.partial(
+    _prune_mm_dense_configs, transposed_b=True
+)
+
+
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("mm"),
     key=["M", "N", "K", "stride_am", "stride_bk"],
+    prune_configs_by={"early_config_prune": _prune_mm_dense_configs},
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm",
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
@@ -220,23 +300,11 @@ def mm_kernel(
         tl.store(C, acc, mask=mask)
 
 
-def _prune_mm_nn_bf16_configs(configs, named_args, **kwargs):
-    return [
-        config
-        for config in configs
-        if config.num_warps != 2
-        or (
-            config.kwargs["BLOCK_M"] <= 32
-            and config.kwargs["BLOCK_N"] <= 64
-        )
-    ]
-
-
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("mm_nn_bf16"),
     key=["M", "N", "K"],
-    prune_configs_by={"early_config_prune": _prune_mm_nn_bf16_configs},
+    prune_configs_by={"early_config_prune": _prune_mm_dense_configs},
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm_nn_bf16",
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
