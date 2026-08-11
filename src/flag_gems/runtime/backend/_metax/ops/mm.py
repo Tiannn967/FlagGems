@@ -532,6 +532,157 @@ def gemv_mm(a, b, c, M, K):
     return c
 
 
+@libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("gemv_k_parallel"),
+    key=["M", "K", "stride_am", "stride_bk"],
+    flagtune_op_name="mm",
+    flagtune_expand_op_name="gemv_k_parallel",
+    flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
+)
+@triton.jit
+def gemv_kernel_k_parallel_partial(
+    A,
+    B,
+    P,
+    M,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    SPLIT_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offsets_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offsets_m < M
+
+    total_k_iters = tl.cdiv(K, BLOCK_K)
+    k_per_split = tl.cdiv(total_k_iters, SPLIT_K)
+    k_start = pid_k * k_per_split
+    k_end = min((pid_k + 1) * k_per_split, total_k_iters)
+
+    acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for k_iter in range(k_start, k_end):
+        offsets_k = k_iter * BLOCK_K + tl.arange(0, BLOCK_K)
+        mask_k = offsets_k < K
+        a = tl.load(
+            A + offsets_m[:, None] * stride_am + offsets_k[None, :] * stride_ak,
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0,
+        )
+        b = tl.load(B + offsets_k * stride_bk, mask=mask_k, other=0.0)
+        acc += tl.sum(a.to(tl.float32) * b.to(tl.float32)[None, :], axis=1)
+
+    tl.store(P + pid_k * M + offsets_m, acc, mask=mask_m)
+
+
+@libentry()
+@triton.jit
+def gemv_kernel_k_parallel_reduce(
+    P,
+    C,
+    M,
+    stride_cm,
+    SPLIT_K: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets_m = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask_m = offsets_m < M
+    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+
+    for split_id in range(0, SPLIT_K):
+        acc += tl.load(P + split_id * M + offsets_m, mask=mask_m, other=0.0)
+
+    tl.store(
+        C + offsets_m * stride_cm,
+        acc.to(C.dtype.element_ty),
+        mask=mask_m,
+    )
+
+
+_GEMV_BLOCK_M = 32
+_GEMV_K_PARALLEL_BLOCK_K = 128
+_GEMV_K_PARALLEL_MAX_SPLITS = 16
+_GEMV_K_PARALLEL_TARGET_SM_NUMERATOR = 1
+_GEMV_K_PARALLEL_TARGET_SM_DENOMINATOR = 2
+
+
+def _floor_power_of_two(value):
+    if value < 1:
+        return 0
+    return 1 << (int(value).bit_length() - 1)
+
+
+def _ceil_power_of_two(value):
+    if value <= 1:
+        return 1
+    return 1 << (int(value - 1).bit_length())
+
+
+def _gemv_k_parallel_split_k(M, K):
+    base_programs = max(1, triton.cdiv(M, _GEMV_BLOCK_M))
+    target_programs = max(
+        1,
+        get_sm_count()
+        * _GEMV_K_PARALLEL_TARGET_SM_NUMERATOR
+        // _GEMV_K_PARALLEL_TARGET_SM_DENOMINATOR,
+    )
+    occupancy_splits = target_programs // base_programs
+    k_splits = max(1, triton.cdiv(K, _GEMV_K_PARALLEL_BLOCK_K))
+
+    split_k = min(
+        _GEMV_K_PARALLEL_MAX_SPLITS,
+        k_splits,
+        _floor_power_of_two(occupancy_splits),
+    )
+    return max(1, split_k)
+
+
+def gemv_mm_k_parallel(a, b, c, M, K):
+    split_k = _gemv_k_parallel_split_k(M, K)
+    _record_mm_shape(
+        "gemv_mm_k_parallel",
+        "GEMS_METAX MM, [mm scenario]: gemv_k_parallel (N=1), "
+        "[shape info]: [%s, %s, 1](M, K, N), [split_k]: %s",
+        M,
+        K,
+        split_k,
+    )
+    partials = torch.empty((split_k, M), device=a.device, dtype=torch.float32)
+    partial_grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        split_k,
+    )
+    reduce_block_size = 256
+    reduce_grid = (triton.cdiv(M, reduce_block_size),)
+
+    with torch_device_fn.device(a.device):
+        gemv_kernel_k_parallel_partial[partial_grid](
+            a,
+            b,
+            partials,
+            M,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            SPLIT_K=split_k,
+        )
+        gemv_kernel_k_parallel_reduce[reduce_grid](
+            partials,
+            c,
+            M,
+            c.stride(0),
+            SPLIT_K=split_k,
+            BLOCK_SIZE=reduce_block_size,
+            num_warps=4,
+        )
+    return c
+
+
 def _reset_splitk_output(args, reset_only=False):
     # Triton benchmarks with positional args; LibTuner resets cached configs by name.
     c = args["C"] if isinstance(args, dict) else args[2]
