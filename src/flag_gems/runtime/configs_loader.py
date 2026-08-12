@@ -226,7 +226,7 @@ class TunedConfigLoader(object):
                 for w in ranges["w"]
             ]
 
-        if op_name in ("mm_nn_bf16", "mm_nt_bf16"):
+        if op_name in ("mm_nn", "mm_nt"):
             # "scenario" is optional so older expand yamls stay loadable, but
             # once present it must be set on every generated config: the tuner's
             # SQL config cache builds its schema from the first config it stores
@@ -570,8 +570,8 @@ class TunedConfigLoader(object):
             "mm": self._build_single_expand_spec(
                 "mm", expand_yaml_path=self._get_expand_config_path("mm")
             ),
-            "mm_nn_bf16": self._build_single_expand_spec("mm_nn_bf16"),
-            "mm_nt_bf16": self._build_single_expand_spec("mm_nt_bf16"),
+            "mm_nn": self._build_single_expand_spec("mm_nn"),
+            "mm_nt": self._build_single_expand_spec("mm_nt"),
             "mm_splitk_two_step": self._build_single_expand_spec(
                 "mm", yaml_op_name="mm_splitk_two_step"
             ),

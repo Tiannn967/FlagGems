@@ -46,7 +46,7 @@ mm:
       stride_am: default
       stride_bk: default
 
-mm_nt_bf16:
+mm_nt:
   - config:
     param_map:
       META:
@@ -229,7 +229,7 @@ gemv_k_parallel:
       stride_am: default
       stride_bk: default
 
-mm_nn_bf16:
+mm_nn:
   - config:
     param_map:
       META:

@@ -247,11 +247,11 @@ def mm_kernel(
 
 @libentry()
 @libtuner(
-    configs=runtime.get_tuned_config("mm_nn_bf16"),
+    configs=runtime.get_tuned_config("mm_nn"),
     key=["M", "N", "K"],
     prune_configs_by={"early_config_prune": _prune_mm_dense_configs},
     flagtune_op_name="mm",
-    flagtune_expand_op_name="mm_nn_bf16",
+    flagtune_expand_op_name="mm_nn",
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
 )
 @triton.heuristics(runtime.get_heuristic_config("mm"))
@@ -262,7 +262,7 @@ def mm_kernel(
     }
 )
 @triton.jit
-def mm_kernel_nn_bf16(
+def mm_kernel_nn(
     A,
     B,
     C,
@@ -311,12 +311,15 @@ def mm_kernel_nn_bf16(
             k_remaining = K - k * BLOCK_K
             a = tl.load(a_ptrs, mask=rk[None, :] < k_remaining, other=0.0)
             b = tl.load(b_ptrs, mask=rk[:, None] < k_remaining, other=0.0)
+        if a.dtype != b.dtype:
+            a = a.to(C.dtype.element_ty)
+            b = b.to(C.dtype.element_ty)
         acc = tl.dot(a, b, acc, out_dtype=tl.float32, allow_tf32=False)
         a_ptrs += BLOCK_K
         b_ptrs += BLOCK_K * N
 
     c_ptrs = C + rm[:, None] * N + rn[None, :]
-    result = acc.to(tl.bfloat16)
+    result = acc.to(C.dtype.element_ty)
     if EVEN_M and EVEN_N:
         tl.store(c_ptrs, result)
     else:
@@ -325,11 +328,11 @@ def mm_kernel_nn_bf16(
 
 @libentry()
 @libtuner(
-    configs=runtime.get_tuned_config("mm_nt_bf16"),
+    configs=runtime.get_tuned_config("mm_nt"),
     key=["M", "N", "K"],
     prune_configs_by={"early_config_prune": _prune_mm_dense_configs_nt},
     flagtune_op_name="mm",
-    flagtune_expand_op_name="mm_nt_bf16",
+    flagtune_expand_op_name="mm_nt",
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
 )
 @triton.heuristics(runtime.get_heuristic_config("mm"))
@@ -340,7 +343,7 @@ def mm_kernel_nn_bf16(
     }
 )
 @triton.jit
-def mm_kernel_nt_bf16(
+def mm_kernel_nt(
     A,
     B,
     C,
@@ -389,12 +392,15 @@ def mm_kernel_nt_bf16(
             k_remaining = K - k * BLOCK_K
             a = tl.load(a_ptrs, mask=rk[None, :] < k_remaining, other=0.0)
             b = tl.load(b_ptrs, mask=rk[:, None] < k_remaining, other=0.0)
+        if a.dtype != b.dtype:
+            a = a.to(C.dtype.element_ty)
+            b = b.to(C.dtype.element_ty)
         acc = tl.dot(a, b, acc, out_dtype=tl.float32, allow_tf32=False)
         a_ptrs += BLOCK_K
         b_ptrs += BLOCK_K
 
     c_ptrs = C + rm[:, None] * N + rn[None, :]
-    result = acc.to(tl.bfloat16)
+    result = acc.to(C.dtype.element_ty)
     if EVEN_M and EVEN_N:
         tl.store(c_ptrs, result)
     else:
@@ -986,12 +992,12 @@ def general_mm(a, b, c, M, N, K):
     return c
 
 
-def general_mm_nn_bf16(a, b, c, M, N, K):
+def general_mm_nn(a, b, c, M, N, K):
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
     )
     with torch_device_fn.device(a.device):
-        mm_kernel_nn_bf16[grid](
+        mm_kernel_nn[grid](
             a,
             b,
             c,
@@ -1003,12 +1009,12 @@ def general_mm_nn_bf16(a, b, c, M, N, K):
     return c
 
 
-def general_mm_nt_bf16(a, b, c, M, N, K):
+def general_mm_nt(a, b, c, M, N, K):
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
     )
     with torch_device_fn.device(a.device):
-        mm_kernel_nt_bf16[grid](
+        mm_kernel_nt[grid](
             a,
             b,
             c,
@@ -1023,7 +1029,7 @@ def general_mm_nt_bf16(a, b, c, M, N, K):
 @functools.lru_cache(maxsize=1)
 def _dense_output_tile_candidates():
     tile_candidates = set()
-    for config_name in ("mm", "mm_nn_bf16", "mm_nt_bf16"):
+    for config_name in ("mm", "mm_nn", "mm_nt"):
         tile_candidates.update(
             (config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"])
             for config in runtime.get_tuned_config(config_name)
@@ -1109,14 +1115,14 @@ def _gemv_k_parallel_scenario(M, K):
     return K >= 2048 and _gemv_k_parallel_split_k(M, K) > 1
 
 
-def nn_bf16_mm_scenario(a, b, c, M, N, K):
+def nn_mm_scenario(a, b, c, M, N, K):
     return (
         M > 0
         and N > 0
         and K > 0
-        and a.dtype is torch.bfloat16
-        and b.dtype is torch.bfloat16
-        and c.dtype is torch.bfloat16
+        and a.dtype in _ordered_datatypes
+        and b.dtype in _ordered_datatypes
+        and c.dtype in _ordered_datatypes
         and a.stride(0) == K
         and a.stride(1) == 1
         and b.stride(0) == N
@@ -1129,14 +1135,14 @@ def nn_bf16_mm_scenario(a, b, c, M, N, K):
     )
 
 
-def nt_bf16_mm_scenario(a, b, c, M, N, K):
+def nt_mm_scenario(a, b, c, M, N, K):
     return (
         M > 0
         and N > 0
         and K > 0
-        and a.dtype is torch.bfloat16
-        and b.dtype is torch.bfloat16
-        and c.dtype is torch.bfloat16
+        and a.dtype in _ordered_datatypes
+        and b.dtype in _ordered_datatypes
+        and c.dtype in _ordered_datatypes
         and a.stride(0) == K
         and a.stride(1) == 1
         and b.stride(0) == 1
@@ -1181,10 +1187,10 @@ def mm(a, b):
     if splitk_mm_scenario(M, N, K):
         c.zero_()
         return splitk_mm(a, b, c, M, N, K)
-    if nn_bf16_mm_scenario(a, b, c, M, N, K):
-        return general_mm_nn_bf16(a, b, c, M, N, K)
-    if nt_bf16_mm_scenario(a, b, c, M, N, K):
-        return general_mm_nt_bf16(a, b, c, M, N, K)
+    if nn_mm_scenario(a, b, c, M, N, K):
+        return general_mm_nn(a, b, c, M, N, K)
+    if nt_mm_scenario(a, b, c, M, N, K):
+        return general_mm_nt(a, b, c, M, N, K)
     return general_mm(a, b, c, M, N, K)
 
 
@@ -1211,8 +1217,8 @@ def mm_out(a, b, *, out):
     if splitk_mm_scenario(M, N, K):
         c.zero_()
         return splitk_mm(a, b, c, M, N, K)
-    if nn_bf16_mm_scenario(a, b, c, M, N, K):
-        return general_mm_nn_bf16(a, b, c, M, N, K)
-    if nt_bf16_mm_scenario(a, b, c, M, N, K):
-        return general_mm_nt_bf16(a, b, c, M, N, K)
+    if nn_mm_scenario(a, b, c, M, N, K):
+        return general_mm_nn(a, b, c, M, N, K)
+    if nt_mm_scenario(a, b, c, M, N, K):
+        return general_mm_nt(a, b, c, M, N, K)
     return general_mm(a, b, c, M, N, K)

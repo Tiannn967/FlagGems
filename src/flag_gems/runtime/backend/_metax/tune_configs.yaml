@@ -247,7 +247,7 @@ mm:
     scenario: ""
   num_stages: 2
   num_warps: 4
-mm_nn_bf16:
+mm_nn:
 - META:
     BLOCK_M: 16
     BLOCK_N: 64
@@ -283,14 +283,6 @@ mm_nn_bf16:
 - META:
     BLOCK_M: 64
     BLOCK_N: 64
-    BLOCK_K: 64
-    pipeline: "null"
-    scenario: ""
-  num_stages: 2
-  num_warps: 4
-- META:
-    BLOCK_M: 64
-    BLOCK_N: 64
     BLOCK_K: 32
     pipeline: "cpasync"
     scenario: ""
@@ -303,14 +295,6 @@ mm_nn_bf16:
     pipeline: "cpasync"
     scenario: ""
   num_stages: 4
-  num_warps: 4
-- META:
-    BLOCK_M: 64
-    BLOCK_N: 64
-    BLOCK_K: 64
-    pipeline: "null"
-    scenario: ""
-  num_stages: 3
   num_warps: 4
 - META:
     BLOCK_M: 64
@@ -321,20 +305,21 @@ mm_nn_bf16:
   num_stages: 2
   num_warps: 4
 - META:
-    BLOCK_M: 16
+    BLOCK_M: 32
     BLOCK_N: 64
     BLOCK_K: 64
-    pipeline: "cpasync"
+    pipeline: "basic"
     scenario: ""
   num_stages: 4
   num_warps: 4
+mm_nt:
 - META:
-    BLOCK_M: 64
-    BLOCK_N: 64
-    BLOCK_K: 32
-    pipeline: "cpasync"
+    BLOCK_M: 16
+    BLOCK_N: 32
+    BLOCK_K: 64
+    pipeline: "basic"
     scenario: ""
-  num_stages: 3
+  num_stages: 4
   num_warps: 4
 - META:
     BLOCK_M: 32
@@ -353,79 +338,6 @@ mm_nn_bf16:
   num_stages: 4
   num_warps: 4
 - META:
-    BLOCK_M: 16
-    BLOCK_N: 64
-    BLOCK_K: 64
-    pipeline: "null"
-    scenario: ""
-  num_stages: 4
-  num_warps: 4
-- META:
-    BLOCK_M: 64
-    BLOCK_N: 32
-    BLOCK_K: 64
-    pipeline: "basic"
-    scenario: ""
-  num_stages: 4
-  num_warps: 4
-- META:
-    BLOCK_M: 16
-    BLOCK_N: 64
-    BLOCK_K: 64
-    pipeline: "basic"
-    scenario: ""
-  num_stages: 4
-  num_warps: 4
-mm_nt_bf16:
-- META:
-    BLOCK_M: 16
-    BLOCK_N: 32
-    BLOCK_K: 64
-    pipeline: "basic"
-    scenario: ""
-  num_stages: 4
-  num_warps: 4
-- META:
-    BLOCK_M: 16
-    BLOCK_N: 64
-    BLOCK_K: 64
-    pipeline: "cpasync"
-    scenario: ""
-  num_stages: 4
-  num_warps: 4
-- META:
-    BLOCK_M: 16
-    BLOCK_N: 64
-    BLOCK_K: 128
-    pipeline: "cpasync"
-    scenario: ""
-  num_stages: 3
-  num_warps: 4
-- META:
-    BLOCK_M: 32
-    BLOCK_N: 32
-    BLOCK_K: 64
-    pipeline: "basic"
-    scenario: ""
-  num_stages: 4
-  num_warps: 4
-- META:
-    BLOCK_M: 32
-    BLOCK_N: 64
-    BLOCK_K: 64
-    pipeline: "basic"
-    scenario: ""
-  num_stages: 4
-  num_warps: 4
-- META:
-    BLOCK_M: 32
-    BLOCK_N: 128
-    BLOCK_K: 32
-    pipeline: "basic"
-    scenario: ""
-  num_stages: 2
-  num_warps: 4
-- META:
     BLOCK_M: 64
     BLOCK_N: 64
     BLOCK_K: 64
@@ -439,23 +351,7 @@ mm_nt_bf16:
     BLOCK_K: 64
     pipeline: "basic"
     scenario: ""
-  num_stages: 3
-  num_warps: 4
-- META:
-    BLOCK_M: 64
-    BLOCK_N: 64
-    BLOCK_K: 64
-    pipeline: "basic"
-    scenario: ""
   num_stages: 4
-  num_warps: 4
-- META:
-    BLOCK_M: 64
-    BLOCK_N: 64
-    BLOCK_K: 64
-    pipeline: "cpasync"
-    scenario: ""
-  num_stages: 2
   num_warps: 4
 - META:
     BLOCK_M: 64
@@ -465,14 +361,6 @@ mm_nt_bf16:
     scenario: ""
   num_stages: 3
   num_warps: 4
-- META:
-    BLOCK_M: 128
-    BLOCK_N: 128
-    BLOCK_K: 64
-    pipeline: "basic"
-    scenario: ""
-  num_stages: 2
-  num_warps: 8
 - META:
     BLOCK_M: 256
     BLOCK_N: 64
@@ -483,22 +371,6 @@ mm_nt_bf16:
   num_warps: 4
 - META:
     BLOCK_M: 128
-    BLOCK_N: 128
-    BLOCK_K: 32
-    pipeline: "basic"
-    scenario: ""
-  num_stages: 2
-  num_warps: 8
-- META:
-    BLOCK_M: 32
-    BLOCK_N: 64
-    BLOCK_K: 64
-    pipeline: "cpasync"
-    scenario: ""
-  num_stages: 3
-  num_warps: 4
-- META:
-    BLOCK_M: 256
     BLOCK_N: 128
     BLOCK_K: 32
     pipeline: "basic"
