@@ -979,9 +979,7 @@ def _two_step_split_k(M, N, K):
     occupancy_split_k = _ceil_power_of_two(required_splits)
 
     k_iters = triton.cdiv(K, block_k)
-    max_k_split = _floor_power_of_two(
-        k_iters // _TWO_STEP_MIN_K_ITERS_PER_SPLIT
-    )
+    max_k_split = _floor_power_of_two(k_iters // _TWO_STEP_MIN_K_ITERS_PER_SPLIT)
     split_k = min(
         occupancy_split_k,
         max_k_split,
@@ -1163,9 +1161,7 @@ def _dense_output_tile_candidates():
             block_ms = ranges.get("BLOCK_M", ())
             block_ns = ranges.get("BLOCK_N", ())
             tile_candidates.update(
-                (block_m, block_n)
-                for block_m in block_ms
-                for block_n in block_ns
+                (block_m, block_n) for block_m in block_ms for block_n in block_ns
             )
 
     return tuple(sorted(tile_candidates))
