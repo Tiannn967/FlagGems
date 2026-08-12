@@ -39,7 +39,6 @@ mm:
       - "cpasync"
     scenario:
       - ""
-      - "fullstage"
   - strategy:
       M: default
       N: default
@@ -271,7 +270,6 @@ mm_nn_bf16:
       - "cpasync"
     scenario:
       - ""
-      - "fullstage"
   - strategy:
       M: default
       N: default

@@ -33,37 +33,6 @@ EXPAND_CONFIG_FILENAME = os.path.normpath(
 )
 
 
-def _mm_shape_recording_enabled():
-    save_dir = os.getenv("GEMS_SAVE_PATH")
-    return bool(
-        save_dir
-        and os.getenv("USE_GEMS_MODE") == "mm"
-        and os.getenv("GEMS_ONCE", "true").lower() == "false"
-    )
-
-
-def _record_mm_shape(func_name, message, *args):
-    if not _mm_shape_recording_enabled():
-        logger.debug(message, *args)
-        return
-
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        if torch.distributed.get_rank() != 0:
-            return
-    elif os.getenv("RANK", os.getenv("LOCAL_RANK", "0")) != "0":
-        return
-
-    save_dir = os.environ["GEMS_SAVE_PATH"]
-    os.makedirs(save_dir, exist_ok=True)
-    log_path = os.path.join(save_dir, "gems-mm.txt")
-    line = f"[DEBUG] {__name__}.{func_name}: {message % args}\n"
-    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-    try:
-        os.write(fd, line.encode("utf-8"))
-    finally:
-        os.close(fd)
-
-
 def _prune_mm_dense_configs(configs, named_args, transposed_b=False, **kwargs):
     configs = list(configs)
     M = named_args["M"]
@@ -76,19 +45,8 @@ def _prune_mm_dense_configs(configs, named_args, transposed_b=False, **kwargs):
         block_n = config.kwargs["BLOCK_N"]
         block_k = config.kwargs["BLOCK_K"]
         pipeline = config.kwargs["pipeline"]
-        scenario = config.kwargs.get("scenario", "")
         warps = config.num_warps
         stages = config.num_stages
-
-        if scenario == "fullstage" and not (
-            block_m == 256
-            and block_n == 256
-            and block_k == 32
-            and pipeline == "basic"
-            and stages == 2
-            and warps == 8
-        ):
-            continue
 
         if block_k == 128:
             if block_m > 128 or block_n > 128 or pipeline != "cpasync":
@@ -98,16 +56,6 @@ def _prune_mm_dense_configs(configs, named_args, transposed_b=False, **kwargs):
             pipeline == "cpasync"
             and block_k >= 64
             and (block_m == 128 or block_n == 128)
-        ):
-            continue
-
-        if (
-            transposed_b
-            and pipeline == "cpasync"
-            and block_k == 16
-            and block_m == 16
-            and block_n == 256
-            and warps >= 4
         ):
             continue
 
@@ -506,12 +454,6 @@ def gemv_kernel(
 
 
 def gemv_mm(a, b, c, M, K):
-    _record_mm_shape(
-        "gemv_mm",
-        "GEMS_METAX MM, [mm scenario]: gemv (N=1), [shape info]: [%s, %s, 1](M, K, N)",
-        M,
-        K,
-    )
     grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]),)
     with torch_device_fn.device(a.device):
         gemv_kernel[grid](
@@ -639,14 +581,6 @@ def _gemv_k_parallel_split_k(M, K):
 
 def gemv_mm_k_parallel(a, b, c, M, K):
     split_k = _gemv_k_parallel_split_k(M, K)
-    _record_mm_shape(
-        "gemv_mm_k_parallel",
-        "GEMS_METAX MM, [mm scenario]: gemv_k_parallel (N=1), "
-        "[shape info]: [%s, %s, 1](M, K, N), [split_k]: %s",
-        M,
-        K,
-        split_k,
-    )
     partials = torch.empty((split_k, M), device=a.device, dtype=torch.float32)
     partial_grid = lambda META: (
         triton.cdiv(M, META["BLOCK_M"]),
@@ -702,18 +636,6 @@ def _splitk_nt_config_aborts(config, transposed_b):
     return False
 
 
-def _prune_mm_splitk_configs(configs, named_args, **kwargs):
-    configs = list(configs)
-    transposed_b = _splitk_b_is_transposed(named_args)
-    pruned_configs = [
-        config
-        for config in configs
-        if not _splitk_nt_config_aborts(config, transposed_b)
-    ]
-
-    return pruned_configs or configs
-
-
 def _prune_mm_splitk_two_step_configs(configs, named_args, **kwargs):
     configs = list(configs)
     N = named_args["N"]
@@ -733,7 +655,6 @@ def _prune_mm_splitk_two_step_configs(configs, named_args, **kwargs):
     configs=runtime.get_tuned_config("mm_splitk"),
     key=["M", "N", "K", "stride_am", "stride_bk"],
     pre_hook=_reset_splitk_output,
-    prune_configs_by={"early_config_prune": _prune_mm_splitk_configs},
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm_splitk",
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
@@ -793,14 +714,6 @@ def mm_kernel_splitk(
 
 
 def splitk_mm(a, b, c, M, N, K):
-    _record_mm_shape(
-        "splitk_mm",
-        "GEMS_METAX MM, [mm scenario]: splitk, [shape info]: "
-        "[-, %s, %s, %s](batch, M, N, K)",
-        M,
-        N,
-        K,
-    )
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
         META["SPLIT_K"],
@@ -1028,15 +941,6 @@ def _launch_splitk_mm_two_step(a, b, c, M, N, K, split_k):
 def splitk_mm_two_step(a, b, c, M, N, K, split_k=None):
     if split_k is None:
         split_k, _ = _two_step_split_k(M, N, K)
-    _record_mm_shape(
-        "splitk_mm_two_step",
-        "GEMS_METAX MM, [mm scenario]: splitk_two_step, [shape info]: "
-        "[-, %s, %s, %s](batch, M, N, K), [split_k]: %s",
-        M,
-        N,
-        K,
-        split_k,
-    )
     return _launch_splitk_mm_two_step(a, b, c, M, N, K, split_k)
 
 
@@ -1059,16 +963,6 @@ def get_higher_dtype(a, b):
 
 def general_mm(a, b, c, M, N, K):
     dot_out_dtype = tl.float32
-    _record_mm_shape(
-        "general_mm",
-        "GEMS_METAX MM, [mm scenario]: general, [shape info]: "
-        "[-, %s, %s, %s](batch, M, N, K), [A column-major]: %s, [B column-major]: %s",
-        M,
-        N,
-        K,
-        a.stride(0) == 1,
-        b.stride(0) == 1,
-    )
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
     )
@@ -1093,14 +987,6 @@ def general_mm(a, b, c, M, N, K):
 
 
 def general_mm_nn_bf16(a, b, c, M, N, K):
-    _record_mm_shape(
-        "general_mm_nn_bf16",
-        "GEMS_METAX MM, [mm scenario]: general_nn_bf16, [shape info]: "
-        "[-, %s, %s, %s](batch, M, N, K)",
-        M,
-        N,
-        K,
-    )
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
     )
@@ -1118,14 +1004,6 @@ def general_mm_nn_bf16(a, b, c, M, N, K):
 
 
 def general_mm_nt_bf16(a, b, c, M, N, K):
-    _record_mm_shape(
-        "general_mm_nt_bf16",
-        "GEMS_METAX MM, [mm scenario]: general_nt_bf16, [shape info]: "
-        "[-, %s, %s, %s](batch, M, N, K)",
-        M,
-        N,
-        K,
-    )
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
     )
@@ -1279,8 +1157,7 @@ def _select_two_step_split_k(M, N, K):
 
 
 def mm(a, b):
-    if not _mm_shape_recording_enabled():
-        logger.debug("GEMS_METAX MM")
+    logger.debug("GEMS_METAX MM")
     device = a.device
     # handle non-contiguous inputs if necessary
     if a.stride(0) > 1 and a.stride(1) > 1:
@@ -1312,8 +1189,7 @@ def mm(a, b):
 
 
 def mm_out(a, b, *, out):
-    if not _mm_shape_recording_enabled():
-        logger.debug("GEMS_METAX MM_OUT")
+    logger.debug("GEMS_METAX MM_OUT")
     # handle non-contiguous inputs if necessary
     if a.stride(0) > 1 and a.stride(1) > 1:
         a = a.contiguous()
