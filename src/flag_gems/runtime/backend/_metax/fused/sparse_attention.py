@@ -30,8 +30,8 @@ fla-org/native-sparse-attention parallel.py (NSA V-chunked pattern).
 
 import os
 
-os.environ.setdefault("TRITON_DISABLE_SWIZZLE", "1")
-# MetaX (mcTriton) compiler-pass enable flags
+# NOTE: these are process-wide mcTriton compiler switches, so they affect every
+# Triton kernel in the process -- not just the ones in this module.
 os.environ.setdefault("TRITON_ENABLE_MACA_OPT_MOVE_DOT_OPERANDS_OUT_LOOP", "1")
 os.environ.setdefault("TRITON_ENABLE_MACA_MERGE_CONVERT_LAYOUT", "1")
 os.environ.setdefault("TRITON_ENABLE_SMEM_OFFSET_CACHE", "1")
