@@ -876,7 +876,9 @@ class TunedConfigLoader(object):
 
         def config_key(config):
             return (
-                tuple(sorted((key, repr(value)) for key, value in config.kwargs.items())),
+                tuple(
+                    sorted((key, repr(value)) for key, value in config.kwargs.items())
+                ),
                 getattr(config, "num_warps", None),
                 getattr(config, "num_ctas", None),
                 getattr(config, "num_stages", None),

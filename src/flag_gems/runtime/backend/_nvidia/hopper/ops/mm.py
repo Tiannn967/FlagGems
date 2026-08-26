@@ -24,9 +24,9 @@ from flag_gems import runtime
 from flag_gems.ops.mm_streamk import streamk_mm
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry, libtuner
-from flag_gems.utils.libentry import LibTuner
 from flag_gems.utils import triton_lang_extension as ext
 from flag_gems.utils.device_info import get_device_capability, get_sm_count
+from flag_gems.utils.libentry import LibTuner
 from flag_gems.utils.triton_version_utils import HAS_TLE, HAS_TLE_DEVICE_MESH
 
 logger = logging.getLogger(__name__)
@@ -734,9 +734,7 @@ def mm_kernel_tma_transposed_direct(
     tl.store(output_ptrs, tl.trans(accumulator_t), mask=mask)
 
 
-def _set_tma_transposed_direct_block_shapes(
-    a_desc, b_desc, block_m, block_n, block_k
-):
+def _set_tma_transposed_direct_block_shapes(a_desc, b_desc, block_m, block_n, block_k):
     a_desc.block_shape = [block_m, block_k]
     b_desc.block_shape = [block_k, block_n]
 
@@ -764,9 +762,7 @@ class _TmaTransposedStableTuner(LibTuner):
         timings = {config: bench_fn(config) for config in configs}
         p50 = {config: float(values[0]) for config, values in timings.items()}
         fastest = min(p50.values())
-        near_ties = [
-            config for config in timings if p50[config] <= fastest * 1.005
-        ]
+        near_ties = [config for config in timings if p50[config] <= fastest * 1.005]
         best_config = max(
             near_ties,
             key=lambda config: (
@@ -833,10 +829,7 @@ def _tma_transposed_splitk_config(M, N, K):
         return None
 
     split8_k_steps = (k_steps + 7) // 8
-    if (
-        2 * sm_count <= 8 * output_ctas <= 4 * sm_count
-        and 3 <= split8_k_steps <= 5
-    ):
+    if 2 * sm_count <= 8 * output_ctas <= 4 * sm_count and 3 <= split8_k_steps <= 5:
         return 16, 128, 8, 2, 4
 
     split4_k_steps = (k_steps + 3) // 4
@@ -887,17 +880,12 @@ def _tma_transposed_runtime_eligible(a, b, c, M, N, K):
         properties = torch.cuda.get_device_properties(a.device)
     except Exception:
         return False
-    if (
-        properties.major != 9
-        or properties.multi_processor_count != _H20_SM_COUNT
-    ):
+    if properties.major != 9 or properties.multi_processor_count != _H20_SM_COUNT:
         return False
     return True
 
 
-def _tile_row_band(
-    extent, tile, first_row, last_row, first_tail=1, last_tail=None
-):
+def _tile_row_band(extent, tile, first_row, last_row, first_tail=1, last_tail=None):
     lower = (first_row - 1) * tile + first_tail
     upper = last_row * tile
     if last_tail is not None:
@@ -923,9 +911,7 @@ def _tma_transposed_direct_tuned_shape(M, N, K):
 
     if medium_k and 1 <= n_cols_64 <= 4:
         return m_rows_16 * n_cols_64 <= sm_count or (
-            5 * K <= 32 * M
-            and 4 * M <= K
-            and m_rows_32 * n_cols_64 <= sm_count
+            5 * K <= 32 * M and 4 * M <= K and m_rows_32 * n_cols_64 <= sm_count
         )
 
     half_ratio = 8 * N <= 4 * K < 9 * N
@@ -934,11 +920,7 @@ def _tma_transposed_direct_tuned_shape(M, N, K):
         half_ratio
         and k_steps_128 >= 16
         and _tile_row_band(M, 32, 9, 9)
-        and (
-            7 < n_cols_64 < 9
-            or 7 < n_cols_128 < 9
-            or 7 < n_cols_256 < 9
-        )
+        and (7 < n_cols_64 < 9 or 7 < n_cols_128 < 9 or 7 < n_cols_256 < 9)
     ):
         return True
 
@@ -950,9 +932,7 @@ def _tma_transposed_direct_tuned_shape(M, N, K):
             direct_ctas <= sm_count
             or (
                 m_rows_32 * n_cols_64 <= sm_count
-                and _tile_row_band(
-                    M, 32, 3, 4, first_tail=8, last_tail=8
-                )
+                and _tile_row_band(M, 32, 3, 4, first_tail=8, last_tail=8)
             )
             or _tile_row_band(M, 16, 9, 14, first_tail=8)
             or (
@@ -970,9 +950,7 @@ def _tma_transposed_direct_tuned_shape(M, N, K):
         return (
             _tile_row_band(M, 16, 2, 2)
             or _tile_row_band(M, 16, 5, 7, first_tail=8)
-            or _tile_row_band(
-                M, 16, 9, 11, first_tail=8, last_tail=8
-            )
+            or _tile_row_band(M, 16, 9, 11, first_tail=8, last_tail=8)
             or _tile_row_band(M, 32, 7, 7, first_tail=8)
             or (
                 8 * sm_count < direct_ctas <= 9 * sm_count
@@ -981,22 +959,15 @@ def _tma_transposed_direct_tuned_shape(M, N, K):
         )
 
     short_k = (
-        3 <= k_steps_128 <= 5
-        and 24 <= n_cols_64 <= 40
-        and 16 * K <= 4 * N < 17 * K
+        3 <= k_steps_128 <= 5 and 24 <= n_cols_64 <= 40 and 16 * K <= 4 * N < 17 * K
     )
     if short_k:
         output_ctas = m_rows_32 * n_cols_64
         return (
             _tile_row_band(M, 16, 1, 3, first_tail=16)
             or _tile_row_band(M, 16, 5, 7, first_tail=8)
-            or _tile_row_band(
-                M, 16, 9, 11, first_tail=8, last_tail=8
-            )
-            or (
-                7 <= m_rows_32 <= 19
-                and 2 * sm_count < output_ctas <= 8 * sm_count
-            )
+            or _tile_row_band(M, 16, 9, 11, first_tail=8, last_tail=8)
+            or (7 <= m_rows_32 <= 19 and 2 * sm_count < output_ctas <= 8 * sm_count)
         )
 
     near_n_wave = (
@@ -1010,14 +981,8 @@ def _tma_transposed_direct_tuned_shape(M, N, K):
             _tile_row_band(M, 16, 1, 3)
             or _tile_row_band(M, 32, 3, 3, first_tail=32)
             or _tile_row_band(M, 16, 7, 7)
-            or (
-                2 * sm_count < general_ctas <= 4 * sm_count
-                and m_tail_64 <= 32
-            )
-            or (
-                5 * sm_count < general_ctas <= 6 * sm_count
-                and m_tail_64 <= 16
-            )
+            or (2 * sm_count < general_ctas <= 4 * sm_count and m_tail_64 <= 32)
+            or (5 * sm_count < general_ctas <= 6 * sm_count and m_tail_64 <= 16)
         )
 
     fragmented_n_wave = (
@@ -1034,11 +999,7 @@ def _tma_transposed_direct_tuned_shape(M, N, K):
             or (4 <= m_rows_64 <= 7 and m_tail_64 <= 32)
         )
 
-    return (
-        medium_k
-        and n_cols_128 >= 16 * sm_count
-        and _tile_row_band(M, 8, 1, 1)
-    )
+    return medium_k and n_cols_128 >= 16 * sm_count and _tile_row_band(M, 8, 1, 1)
 
 
 def tma_transposed_direct_tuned_scenario(a, b, c, M, N, K):
@@ -1441,8 +1402,7 @@ def _prune_warp_specialized_configs(configs, named_args, **kwargs):
     return [
         config
         for config in configs
-        if config.kwargs["BLOCK_M"] == block_m
-        and config.kwargs["BLOCK_N"] == block_n
+        if config.kwargs["BLOCK_M"] == block_m and config.kwargs["BLOCK_N"] == block_n
     ]
 
 
@@ -1546,11 +1506,7 @@ if HAS_TLE_WARP_SPECIALIZATION:
 
             offs_m = pid_m * BLOCK_M + tl.arange(0, 64)
             n_128 = tile_n_start + tl.arange(0, 128)
-            ptrs_128 = (
-                c_ptr
-                + offs_m[:, None] * stride_cm
-                + n_128[None, :] * stride_cn
-            )
+            ptrs_128 = c_ptr + offs_m[:, None] * stride_cm + n_128[None, :] * stride_cn
             mask_128 = (offs_m[:, None] < M) & (n_128[None, :] < N)
             tl.store(ptrs_128, acc_128.to(c_ptr.dtype.element_ty), mask=mask_128)
             if fragmented:
@@ -1622,11 +1578,7 @@ if HAS_TLE_WARP_SPECIALIZATION:
 
             offs_m = pid_m * BLOCK_M + 64 + tl.arange(0, tail_m)
             n_128 = tile_n_start + tl.arange(0, 128)
-            ptrs_128 = (
-                c_ptr
-                + offs_m[:, None] * stride_cm
-                + n_128[None, :] * stride_cn
-            )
+            ptrs_128 = c_ptr + offs_m[:, None] * stride_cm + n_128[None, :] * stride_cn
             mask_128 = (offs_m[:, None] < M) & (n_128[None, :] < N)
             tl.store(
                 ptrs_128,
@@ -1636,9 +1588,7 @@ if HAS_TLE_WARP_SPECIALIZATION:
             if fragmented:
                 n_64 = tile_n_start + 128 + tl.arange(0, 64)
                 ptrs_64 = (
-                    c_ptr
-                    + offs_m[:, None] * stride_cm
-                    + n_64[None, :] * stride_cn
+                    c_ptr + offs_m[:, None] * stride_cm + n_64[None, :] * stride_cn
                 )
                 mask_64 = (
                     (offs_m[:, None] < M)
@@ -1703,9 +1653,7 @@ if HAS_TLE_WARP_SPECIALIZATION:
     @libtuner(
         configs=_get_warp_specialized_mm_configs(),
         key=["M", "N", "K"],
-        prune_configs_by={
-            "early_config_prune": _prune_warp_specialized_configs
-        },
+        prune_configs_by={"early_config_prune": _prune_warp_specialized_configs},
         strategy=["default", "default", "default"],
         policy="flagtune",
         warmup=5,
@@ -1892,10 +1840,7 @@ def _warp_specialized_mm_runtime_eligible(a, b, c, M, N, K):
         properties = torch.cuda.get_device_properties(a.device)
     except Exception:
         return False
-    return (
-        properties.major == 9
-        and properties.multi_processor_count == _H20_SM_COUNT
-    )
+    return properties.major == 9 and properties.multi_processor_count == _H20_SM_COUNT
 
 
 def _select_warp_specialized_dispatch_plan(a, b, c, M, N, K):
@@ -1939,14 +1884,10 @@ def warp_specialized_mm(a, b, c, M, N, K):
     )
     a_desc, b_desc = _warp_specialized_mm_descriptors(a, b)
     if plan == _WS_PLAN_FRAGMENTED_N:
-        grid = lambda META: (
-            triton.cdiv(M, META["BLOCK_M"])
-            * triton.cdiv(N, 160),
-        )
+        grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, 160),)
     else:
         grid = lambda META: (
-            triton.cdiv(M, META["BLOCK_M"])
-            * triton.cdiv(N, META["BLOCK_N"]),
+            triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
         )
     with torch_device_fn.device(a.device):
         mm_kernel_warp_specialized_tma[grid](
