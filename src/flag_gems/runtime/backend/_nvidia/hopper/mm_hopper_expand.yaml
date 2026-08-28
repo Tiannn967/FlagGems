@@ -94,6 +94,7 @@ mm_tma_transposed_direct:
      M: default
      N: default
      K: default
+     B_ROW_MAJOR: default
 mm_warp_specialized_tma:
   - config:
     param_map:
@@ -122,6 +123,7 @@ mm_warp_specialized_tma:
      M: default
      N: default
      K: default
+     B_ROW_MAJOR: default
 mm_splitk:
   - config:
     param_map:

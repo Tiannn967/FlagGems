@@ -650,6 +650,7 @@ def mm_kernel_tma_transposed_splitk_partials(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    B_ROW_MAJOR: tl.constexpr,
 ):
     tile_id = tl.program_id(0)
     split_id = tl.program_id(1)
@@ -668,9 +669,12 @@ def mm_kernel_tma_transposed_splitk_partials(
     for k_block in range(k_begin, k_end):
         offset_k = (k_block * BLOCK_K).to(tl.int32)
         a = a_desc.load([offset_m, offset_k])
-        b = b_desc.load([offset_k, offset_n])
+        if B_ROW_MAJOR:
+            b_t = tl.trans(b_desc.load([offset_k, offset_n]))
+        else:
+            b_t = b_desc.load([offset_n, offset_k])
         accumulator_t = tl.dot(
-            tl.trans(b),
+            b_t,
             tl.trans(a),
             acc=accumulator_t,
             allow_tf32=False,
@@ -702,6 +706,7 @@ def mm_kernel_tma_transposed_direct(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     N_MAJOR: tl.constexpr,
+    B_ROW_MAJOR: tl.constexpr,
 ):
     tile_id = tl.program_id(0)
     grid_m = tl.cdiv(M, BLOCK_M)
@@ -719,9 +724,12 @@ def mm_kernel_tma_transposed_direct(
     for k_block in range(0, tl.cdiv(K, BLOCK_K)):
         offset_k = (k_block * BLOCK_K).to(tl.int32)
         a = a_desc.load([offset_m, offset_k])
-        b = b_desc.load([offset_k, offset_n])
+        if B_ROW_MAJOR:
+            b_t = tl.trans(b_desc.load([offset_k, offset_n]))
+        else:
+            b_t = b_desc.load([offset_n, offset_k])
         accumulator_t = tl.dot(
-            tl.trans(b),
+            b_t,
             tl.trans(a),
             acc=accumulator_t,
             allow_tf32=False,
@@ -734,9 +742,13 @@ def mm_kernel_tma_transposed_direct(
     tl.store(output_ptrs, tl.trans(accumulator_t), mask=mask)
 
 
-def _set_tma_transposed_direct_block_shapes(a_desc, b_desc, block_m, block_n, block_k):
+def _set_tma_transposed_direct_block_shapes(
+    a_desc, b_desc, block_m, block_n, block_k, b_row_major
+):
     a_desc.block_shape = [block_m, block_k]
-    b_desc.block_shape = [block_k, block_n]
+    b_desc.block_shape = (
+        [block_k, block_n] if b_row_major else [block_n, block_k]
+    )
 
 
 def _tma_transposed_direct_set_block_size_hook(nargs):
@@ -746,6 +758,7 @@ def _tma_transposed_direct_set_block_size_hook(nargs):
         nargs["BLOCK_M"],
         nargs["BLOCK_N"],
         nargs["BLOCK_K"],
+        nargs["B_ROW_MAJOR"],
     )
 
 
@@ -777,8 +790,8 @@ class _TmaTransposedStableTuner(LibTuner):
 mm_kernel_tma_transposed_direct_tuned = libentry()(
     libtuner(
         configs=_get_tma_transposed_direct_tuned_configs(),
-        key=["M", "N", "K"],
-        strategy=["default", "default", "default"],
+        key=["M", "N", "K", "B_ROW_MAJOR"],
+        strategy=["default", "default", "default", "default"],
         policy=_TmaTransposedStableTuner,
         warmup=10,
         rep=20,
@@ -868,10 +881,10 @@ def _tma_transposed_runtime_eligible(a, b, c, M, N, K):
         and a.device == b.device == c.device
         and tuple(c.shape) == (M, N)
         and a.is_contiguous()
-        and b.is_contiguous()
+        and (b.is_contiguous() or b.T.is_contiguous())
         and c.is_contiguous()
         and _is_tma_descriptor_aligned(a)
-        and _is_tma_descriptor_aligned(b)
+        and _is_tma_descriptor_aligned(b, allow_transpose=True)
         and _is_tma_descriptor_aligned(c)
     ):
         return False
@@ -1002,10 +1015,49 @@ def _tma_transposed_direct_tuned_shape(M, N, K):
     return medium_k and n_cols_128 >= 16 * sm_count and _tile_row_band(M, 8, 1, 1)
 
 
+def _tma_transposed_direct_column_major_shape(M, N, K):
+    if M < 1 or N < 64 or N % 32 or K % 128:
+        return False
+
+    sm_count = _H20_SM_COUNT
+    m_rows_32 = (M + 31) // 32
+    n_cols_64 = (N + 63) // 64
+    k_steps_128 = K // 128
+    if k_steps_128 < 12:
+        return False
+
+    direct_ctas = m_rows_32 * n_cols_64
+    if 4 * N >= 28 * K:
+        return False
+
+    if 4 * M <= K and 2 * direct_ctas <= 5 * sm_count:
+        return True
+
+    if M <= 96:
+        return True
+
+    if M <= 128 and K <= 8 * N and 4 * N < 12 * K:
+        return True
+
+    if 2 * N < K:
+        return False
+
+    if M <= 512 and direct_ctas <= 5 * sm_count:
+        return True
+
+    m_tail_64 = M - ((M - 1) // 64) * 64
+    return m_rows_32 <= 5 and m_tail_64 <= 32
+
+
 def tma_transposed_direct_tuned_scenario(a, b, c, M, N, K):
-    return _tma_transposed_direct_tuned_shape(
-        M, N, K
-    ) and _tma_transposed_runtime_eligible(a, b, c, M, N, K)
+    shape_matches = _tma_transposed_direct_tuned_shape(M, N, K)
+    if not shape_matches and not b.is_contiguous() and b.T.is_contiguous():
+        shape_matches = (
+            _tma_transposed_direct_column_major_shape(M, N, K)
+            and _tma_transposed_splitk_config(M, N, K) is None
+            and not splitk_scenario(a, b, M, N, K)
+        )
+    return shape_matches and _tma_transposed_runtime_eligible(a, b, c, M, N, K)
 
 
 def tma_transposed_direct_tuned_mm(a, b, c, M, N, K):
@@ -1019,8 +1071,11 @@ def tma_transposed_direct_tuned_mm(a, b, c, M, N, K):
     from triton.tools.tensor_descriptor import TensorDescriptor
 
     dummy_block = [1, 1]
+    b_row_major = b.stride(1) == 1
     a_desc = TensorDescriptor.from_tensor(a, block_shape=dummy_block)
-    b_desc = TensorDescriptor.from_tensor(b, block_shape=dummy_block)
+    b_desc = TensorDescriptor.from_tensor(
+        b if b_row_major else b.T, block_shape=dummy_block
+    )
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
     )
@@ -1034,6 +1089,7 @@ def tma_transposed_direct_tuned_mm(a, b, c, M, N, K):
             K,
             c.stride(0),
             c.stride(1),
+            B_ROW_MAJOR=b_row_major,
         )
     return c
 
@@ -1051,8 +1107,12 @@ def tma_transposed_mm(a, b, c, M, N, K, config):
     )
     from triton.tools.tensor_descriptor import TensorDescriptor
 
+    b_row_major = b.stride(1) == 1
     a_desc = TensorDescriptor.from_tensor(a, block_shape=[block_m, block_k])
-    b_desc = TensorDescriptor.from_tensor(b, block_shape=[block_k, block_n])
+    b_desc = TensorDescriptor.from_tensor(
+        b if b_row_major else b.T,
+        block_shape=[block_k, block_n] if b_row_major else [block_n, block_k],
+    )
     output_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
 
     with torch_device_fn.device(a.device):
@@ -1071,6 +1131,7 @@ def tma_transposed_mm(a, b, c, M, N, K, config):
             BLOCK_N=block_n,
             BLOCK_K=block_k,
             SPLIT_K=split_k,
+            B_ROW_MAJOR=b_row_major,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -1219,24 +1280,26 @@ def mm_kernel_splitk(
     BLOCK_K: tl.constexpr,
     SPLIT_K: tl.constexpr,
 ):
+    tile_m: tl.constexpr = 16 if BLOCK_M < 16 else BLOCK_M
+    tile_n: tl.constexpr = 16 if BLOCK_N < 16 else BLOCK_N
     pid = tl.program_id(0)
     pid_k = tl.program_id(1)
 
-    grid_n = tl.cdiv(N, BLOCK_N)
+    grid_n = tl.cdiv(N, tile_n)
     pid_m = pid // grid_n
     pid_n = pid % grid_n
 
-    offset_am = pid_m * BLOCK_M
-    offset_bn = pid_n * BLOCK_N
-    offs_am = offset_am + tl.arange(0, BLOCK_M)
-    offs_bn = offset_bn + tl.arange(0, BLOCK_N)
+    offset_am = pid_m * tile_m
+    offset_bn = pid_n * tile_n
+    offs_am = offset_am + tl.arange(0, tile_m)
+    offs_bn = offset_bn + tl.arange(0, tile_n)
 
     total_k_iters = tl.cdiv(K, BLOCK_K)
     k_per_split = tl.cdiv(total_k_iters, SPLIT_K)
     k_start = pid_k * k_per_split
     k_end = min((pid_k + 1) * k_per_split, total_k_iters)
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc = tl.zeros((tile_m, tile_n), dtype=tl.float32)
     for k in range(k_start, k_end):
         offset_k = k * BLOCK_K
         offs_k = offset_k + tl.arange(0, BLOCK_K)
@@ -1253,8 +1316,8 @@ def mm_kernel_splitk(
         )
         acc += tl.dot(a, b, out_dtype=tl.float32, allow_tf32=False)
 
-    offs_cm = offset_am + tl.arange(0, BLOCK_M)
-    offs_cn = offset_bn + tl.arange(0, BLOCK_N)
+    offs_cm = offset_am + tl.arange(0, tile_m)
+    offs_cn = offset_bn + tl.arange(0, tile_n)
     c_ptrs = C + offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
     mask = (offs_cm < M)[:, None] & (offs_cn < N)[None, :]
     tl.atomic_add(c_ptrs, acc, mask=mask)
@@ -1269,7 +1332,8 @@ def splitk_mm(a, b, c, M, N, K, op_name="mm"):
         K,
     )
     grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+        triton.cdiv(M, max(META["BLOCK_M"], 16))
+        * triton.cdiv(N, max(META["BLOCK_N"], 16)),
         META["SPLIT_K"],
     )
     with torch_device_fn.device(a.device):
@@ -1313,7 +1377,14 @@ def streamk_scenario(a, b, M, N, K):
 
 
 def splitk_scenario(a, b, M, N, K):
-    return M < 2048 and N < 2048 and K >= 4096
+    if M >= 2048 or N >= 2048 or K < 4096:
+        return False
+    output_ctas = triton.cdiv(M, 16) * triton.cdiv(N, 32)
+    sm_count = min(_get_sm_count_for_tensor(a), _H20_SM_COUNT)
+    cta_limit = sm_count // 2
+    if K >= 6144 and not b.is_contiguous() and b.T.is_contiguous():
+        cta_limit = 3 * sm_count // 4
+    return output_ctas <= cta_limit
 
 
 _WS_PLAN_SPLIT_M = 2
@@ -1349,7 +1420,11 @@ def _warp_specialized_tma_set_block_size_hook(nargs):
     block_n = nargs["BLOCK_N"]
     block_k = nargs["BLOCK_K"]
     nargs["a_desc"].block_shape = [block_m, block_k]
-    nargs["b_desc"].block_shape = [block_k, block_n]
+    nargs["b_desc"].block_shape = (
+        [block_k, block_n]
+        if nargs["B_ROW_MAJOR"]
+        else [block_n, block_k]
+    )
 
 
 def _estimate_warp_specialized_shared_memory_bytes(
@@ -1454,6 +1529,7 @@ if HAS_TLE_WARP_SPECIALIZATION:
         num_stages: tl.constexpr,
         CONSUMER_ID: tl.constexpr,
         WS_PLAN: tl.constexpr,
+        B_ROW_MAJOR: tl.constexpr,
     ):
         fragmented: tl.constexpr = WS_PLAN == 3
         pid = tl.program_id(0)
@@ -1481,16 +1557,28 @@ if HAS_TLE_WARP_SPECIALIZATION:
                 )
                 b_full = b_smem.slot(index)
                 if fragmented:
-                    b_128 = _warp_specialized_smem_subslice(
-                        b_full, [0, 0], [BLOCK_K, 128]
-                    )
-                    b_fragment = _warp_specialized_smem_subslice(
-                        b_full, [0, 128], [BLOCK_K, 32]
-                    )
+                    if B_ROW_MAJOR:
+                        b_128 = _warp_specialized_smem_subslice(
+                            b_full, [0, 0], [BLOCK_K, 128]
+                        )
+                        b_fragment = _warp_specialized_smem_subslice(
+                            b_full, [0, 128], [BLOCK_K, 32]
+                        )
+                    else:
+                        b_128 = _warp_specialized_smem_subslice(
+                            b_full, [0, 0], [128, BLOCK_K]
+                        )
+                        b_fragment = _warp_specialized_smem_subslice(
+                            b_full, [128, 0], [32, BLOCK_K]
+                        )
                 else:
                     b_128 = b_full
                 acc_128 = tle_exp.gpu.wgmma(
-                    a_head, b_128, acc_128, out_dtype=tl.float32
+                    a_head,
+                    b_128,
+                    acc_128,
+                    out_dtype=tl.float32,
+                    trans_b=not B_ROW_MAJOR,
                 )
                 acc_128 = tle_exp.gpu.wgmma_wait(0, acc_128)
                 if fragmented:
@@ -1499,6 +1587,7 @@ if HAS_TLE_WARP_SPECIALIZATION:
                         b_fragment,
                         acc_fragment,
                         out_dtype=tl.float32,
+                        trans_b=not B_ROW_MAJOR,
                     )
                     acc_fragment = tle_exp.gpu.wgmma_wait(0, acc_fragment)
                 tle_exp.gpu.barrier_arrive(empty_a[index], phaseIdx=phase)
@@ -1546,12 +1635,20 @@ if HAS_TLE_WARP_SPECIALIZATION:
                 )
                 b_full = b_smem.slot(index)
                 if fragmented:
-                    b_128 = _warp_specialized_smem_subslice(
-                        b_full, [0, 0], [BLOCK_K, 128]
-                    )
-                    b_64 = _warp_specialized_smem_subslice(
-                        b_full, [0, 128], [BLOCK_K, 64]
-                    )
+                    if B_ROW_MAJOR:
+                        b_128 = _warp_specialized_smem_subslice(
+                            b_full, [0, 0], [BLOCK_K, 128]
+                        )
+                        b_64 = _warp_specialized_smem_subslice(
+                            b_full, [0, 128], [BLOCK_K, 64]
+                        )
+                    else:
+                        b_128 = _warp_specialized_smem_subslice(
+                            b_full, [0, 0], [128, BLOCK_K]
+                        )
+                        b_64 = _warp_specialized_smem_subslice(
+                            b_full, [128, 0], [64, BLOCK_K]
+                        )
                 else:
                     b_128 = b_full
                 acc_128_t = tle_exp.gpu.wgmma(
@@ -1559,7 +1656,7 @@ if HAS_TLE_WARP_SPECIALIZATION:
                     a_tail,
                     acc_128_t,
                     out_dtype=tl.float32,
-                    trans_a=True,
+                    trans_a=B_ROW_MAJOR,
                     trans_b=True,
                 )
                 acc_128_t = tle_exp.gpu.wgmma_wait(0, acc_128_t)
@@ -1569,7 +1666,7 @@ if HAS_TLE_WARP_SPECIALIZATION:
                         a_tail,
                         acc_64_t,
                         out_dtype=tl.float32,
-                        trans_a=True,
+                        trans_a=B_ROW_MAJOR,
                         trans_b=True,
                     )
                     acc_64_t = tle_exp.gpu.wgmma_wait(0, acc_64_t)
@@ -1619,6 +1716,7 @@ if HAS_TLE_WARP_SPECIALIZATION:
         BLOCK_K: tl.constexpr,
         TILE_N: tl.constexpr,
         num_stages: tl.constexpr,
+        B_ROW_MAJOR: tl.constexpr,
     ):
         pid = tl.program_id(0)
         num_pid_n: tl.constexpr = tl.cdiv(N, TILE_N)
@@ -1641,20 +1739,29 @@ if HAS_TLE_WARP_SPECIALIZATION:
                 barrier=full_a[index],
             )
             tle_exp.gpu.barrier_wait(empty_b[index], phaseIdx=phase)
-            tle_exp.gpu.copy(
-                b_desc,
-                b_smem.slot(index),
-                [BLOCK_K, BLOCK_N],
-                [k_start, n_start],
-                barrier=full_b[index],
-            )
+            if B_ROW_MAJOR:
+                tle_exp.gpu.copy(
+                    b_desc,
+                    b_smem.slot(index),
+                    [BLOCK_K, BLOCK_N],
+                    [k_start, n_start],
+                    barrier=full_b[index],
+                )
+            else:
+                tle_exp.gpu.copy(
+                    b_desc,
+                    b_smem.slot(index),
+                    [BLOCK_N, BLOCK_K],
+                    [n_start, k_start],
+                    barrier=full_b[index],
+                )
 
     @libentry()
     @libtuner(
         configs=_get_warp_specialized_mm_configs(),
-        key=["M", "N", "K"],
+        key=["M", "N", "K", "B_ROW_MAJOR"],
         prune_configs_by={"early_config_prune": _prune_warp_specialized_configs},
-        strategy=["default", "default", "default"],
+        strategy=["default", "default", "default", "default"],
         policy="flagtune",
         warmup=5,
         rep=10,
@@ -1679,6 +1786,7 @@ if HAS_TLE_WARP_SPECIALIZATION:
         num_warps: tl.constexpr,
         num_stages: tl.constexpr,
         WS_PLAN: tl.constexpr,
+        B_ROW_MAJOR: tl.constexpr,
     ):
         _ = num_warps
         split_m: tl.constexpr = WS_PLAN == 2
@@ -1696,12 +1804,20 @@ if HAS_TLE_WARP_SPECIALIZATION:
             layout=None,
             scope=tle_exp.gpu.smem,
         )
-        b_smem = tle_exp.gpu.alloc(
-            [num_stages, BLOCK_K, BLOCK_N],
-            dtype=b_desc.dtype,
-            layout=None,
-            scope=tle_exp.gpu.smem,
-        )
+        if B_ROW_MAJOR:
+            b_smem = tle_exp.gpu.alloc(
+                [num_stages, BLOCK_K, BLOCK_N],
+                dtype=b_desc.dtype,
+                layout=None,
+                scope=tle_exp.gpu.smem,
+            )
+        else:
+            b_smem = tle_exp.gpu.alloc(
+                [num_stages, BLOCK_N, BLOCK_K],
+                dtype=b_desc.dtype,
+                layout=None,
+                scope=tle_exp.gpu.smem,
+            )
         empty_a = tle_exp.gpu.alloc_barriers(
             num_barriers=num_stages,
             arrive_count=2,
@@ -1751,6 +1867,7 @@ if HAS_TLE_WARP_SPECIALIZATION:
                         BLOCK_K,
                         tile_n,
                         num_stages,
+                        B_ROW_MAJOR,
                     ),
                 ),
                 (
@@ -1775,6 +1892,7 @@ if HAS_TLE_WARP_SPECIALIZATION:
                         num_stages,
                         0,
                         WS_PLAN,
+                        B_ROW_MAJOR,
                     ),
                 ),
                 (
@@ -1799,6 +1917,7 @@ if HAS_TLE_WARP_SPECIALIZATION:
                         num_stages,
                         1,
                         WS_PLAN,
+                        B_ROW_MAJOR,
                     ),
                 ),
             ],
@@ -1826,10 +1945,10 @@ def _warp_specialized_mm_runtime_eligible(a, b, c, M, N, K):
         and c.dtype == torch.bfloat16
         and tuple(c.shape) == (M, N)
         and a.is_contiguous()
-        and b.is_contiguous()
+        and (b.is_contiguous() or b.T.is_contiguous())
         and c.is_contiguous()
         and _is_tma_descriptor_aligned(a)
-        and _is_tma_descriptor_aligned(b)
+        and _is_tma_descriptor_aligned(b, allow_transpose=True)
         and _is_tma_descriptor_aligned(c)
         and N % 64 == 0
         and K % 128 == 0
@@ -1856,7 +1975,7 @@ def warp_specialized_mm_scenario(a, b, c, M, N, K):
     return _select_warp_specialized_dispatch_plan(a, b, c, M, N, K) is not None
 
 
-def _warp_specialized_mm_descriptors(a, b):
+def _warp_specialized_mm_descriptors(a, b, b_row_major):
     from triton.tools.tensor_descriptor import TensorDescriptor
 
     def alloc_fn(size: int, align: int, stream: Optional[int]):
@@ -1866,7 +1985,9 @@ def _warp_specialized_mm_descriptors(a, b):
     dummy_block = [1, 1]
     return (
         TensorDescriptor.from_tensor(a, block_shape=dummy_block),
-        TensorDescriptor.from_tensor(b, block_shape=dummy_block),
+        TensorDescriptor.from_tensor(
+            b if b_row_major else b.T, block_shape=dummy_block
+        ),
     )
 
 
@@ -1882,7 +2003,8 @@ def warp_specialized_mm(a, b, c, M, N, K):
         N,
         K,
     )
-    a_desc, b_desc = _warp_specialized_mm_descriptors(a, b)
+    b_row_major = b.stride(1) == 1
+    a_desc, b_desc = _warp_specialized_mm_descriptors(a, b, b_row_major)
     if plan == _WS_PLAN_FRAGMENTED_N:
         grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, 160),)
     else:
@@ -1900,6 +2022,7 @@ def warp_specialized_mm(a, b, c, M, N, K):
             stride_cm=c.stride(0),
             stride_cn=c.stride(1),
             WS_PLAN=plan,
+            B_ROW_MAJOR=b_row_major,
         )
     return c
 
@@ -2184,6 +2307,9 @@ def mm(a, b):
     if streamk_scenario(a, b, M, N, K):
         sm_count = _get_sm_count_for_tensor(a)
         return streamk_mm(a, b, c, M, N, K, sm_count=sm_count)
+    # if HAS_TLE and BLOCK_CLUSTER_MESH is not None:
+    #     if cluster_remote_mm_scenario(a, b, c, M, N, K):
+    #         return cluster_remote_mm(a, b, c, M, N, K)
     # Use splitk for small M
     if splitk_scenario(a, b, M, N, K):
         c.zero_()
@@ -2217,6 +2343,9 @@ def mm_out(a, b, *, out):
     if streamk_scenario(a, b, M, N, K):
         sm_count = _get_sm_count_for_tensor(a)
         return streamk_mm(a, b, out, M, N, K, sm_count=sm_count)
+    # if HAS_TLE and BLOCK_CLUSTER_MESH is not None:
+    #     if cluster_remote_mm_scenario(a, b, out, M, N, K):
+    #         return cluster_remote_mm(a, b, out, M, N, K)
     # Use splitk for small M
     if splitk_scenario(a, b, M, N, K):
         out.zero_()
