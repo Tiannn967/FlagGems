@@ -746,9 +746,7 @@ def _set_tma_transposed_direct_block_shapes(
     a_desc, b_desc, block_m, block_n, block_k, b_row_major
 ):
     a_desc.block_shape = [block_m, block_k]
-    b_desc.block_shape = (
-        [block_k, block_n] if b_row_major else [block_n, block_k]
-    )
+    b_desc.block_shape = [block_k, block_n] if b_row_major else [block_n, block_k]
 
 
 def _tma_transposed_direct_set_block_size_hook(nargs):
@@ -1421,9 +1419,7 @@ def _warp_specialized_tma_set_block_size_hook(nargs):
     block_k = nargs["BLOCK_K"]
     nargs["a_desc"].block_shape = [block_m, block_k]
     nargs["b_desc"].block_shape = (
-        [block_k, block_n]
-        if nargs["B_ROW_MAJOR"]
-        else [block_n, block_k]
+        [block_k, block_n] if nargs["B_ROW_MAJOR"] else [block_n, block_k]
     )
 
 
