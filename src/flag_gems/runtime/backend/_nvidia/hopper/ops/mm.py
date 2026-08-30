@@ -1004,7 +1004,7 @@ def _tma_transposed_direct_tuned_shape(M, N, K):
     )
     if fragmented_n_wave:
         return (
-            _tile_row_band(M, 8, 1, 1, first_tail=4)
+            _tile_row_band(M, 8, 1, 1)
             or _tile_row_band(M, 16, 2, 3)
             or _tile_row_band(M, 64, 3, 3)
             or (4 <= m_rows_64 <= 7 and m_tail_64 <= 32)
@@ -1034,7 +1034,7 @@ def _tma_transposed_direct_column_major_shape(M, N, K):
     if M <= 96:
         return True
 
-    if M <= 128 and K <= 8 * N and 4 * N < 12 * K:
+    if M <= 128 and K <= 8 * N and (4 * N < 12 * K or n_cols_64 >= 3 * sm_count):
         return True
 
     if 2 * N < K:
@@ -1047,11 +1047,35 @@ def _tma_transposed_direct_column_major_shape(M, N, K):
     return m_rows_32 <= 5 and m_tail_64 <= 32
 
 
+def _tma_transposed_direct_general_shape(M, N, K):
+    if M < 1 or N < 32 or N % 32 or K < 256 or K % 128:
+        return False
+    if K < 1024 and N < 8 * K:
+        return False
+
+    m_rows_32 = (M + 31) // 32
+    n_cols_64 = (N + 63) // 64
+    direct_ctas = m_rows_32 * n_cols_64
+    deep_wide = (
+        32 <= K // 128 <= 64
+        and m_rows_32 <= 4
+        and 2 * _H20_SM_COUNT <= n_cols_64 <= 5 * _H20_SM_COUNT
+    )
+    return (K <= 4 * N and (direct_ctas <= 5 * _H20_SM_COUNT or deep_wide)) or (
+        (m_rows_32 == 1 or 56 <= M <= 96) and n_cols_64 > 5 * _H20_SM_COUNT
+    )
+
+
 def tma_transposed_direct_tuned_scenario(a, b, c, M, N, K):
     shape_matches = _tma_transposed_direct_tuned_shape(M, N, K)
-    if not shape_matches and not b.is_contiguous() and b.T.is_contiguous():
+    if not shape_matches:
+        column_major_shape = (
+            not b.is_contiguous()
+            and b.T.is_contiguous()
+            and _tma_transposed_direct_column_major_shape(M, N, K)
+        )
         shape_matches = (
-            _tma_transposed_direct_column_major_shape(M, N, K)
+            (_tma_transposed_direct_general_shape(M, N, K) or column_major_shape)
             and _tma_transposed_splitk_config(M, N, K) is None
             and not splitk_scenario(a, b, M, N, K)
         )
@@ -1150,8 +1174,13 @@ def tma_transposed_mm(a, b, c, M, N, K, config):
 @libtuner(
     configs=[
         triton.Config(
+            {"BLOCK_M": 1, "BLOCK_K": 128},
+            num_warps=1,
+            num_stages=3,
+        ),
+        triton.Config(
             {"BLOCK_M": 32, "BLOCK_K": 256},
-        )
+        ),
     ],
     key=["M", "K", "stride_am", "stride_bk"],
     strategy=["align32", "align32", "align32", "default"],
@@ -1175,8 +1204,14 @@ def gemv_kernel(
     stride_am,
     stride_ak,
     stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    partial_stride,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    N_VECTORS: tl.constexpr = 1,
+    SPLIT_K: tl.constexpr = 1,
     IS_FP64: tl.constexpr = False,
 ):
     """Optimized kernel for matrix-vector multiplication (N=1 case)"""
@@ -1193,9 +1228,23 @@ def gemv_kernel(
     else:
         acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
 
-    # Iterate over K dimension
-    for k_start in range(0, K, BLOCK_K):
-        k_offset = k_start + tl.arange(0, BLOCK_K)
+    if SPLIT_K == 1:
+        block_start = 0
+        block_end = tl.cdiv(K, BLOCK_K)
+        split_id = 0
+    else:
+        split_id = tl.program_id(1)
+        total_blocks = tl.cdiv(K, BLOCK_K)
+        blocks_per_split = tl.cdiv(total_blocks, SPLIT_K)
+        block_start = split_id * blocks_per_split
+        block_end = min(block_start + blocks_per_split, total_blocks)
+    if N_VECTORS == 1:
+        vector_id = 0
+    else:
+        vector_id = tl.program_id(2)
+
+    for block in range(block_start, block_end):
+        k_offset = block * BLOCK_K + tl.arange(0, BLOCK_K)
         k_mask = k_offset < K
 
         # Load block from matrix A: [BLOCK_M, BLOCK_K]
@@ -1203,7 +1252,7 @@ def gemv_kernel(
         a = tl.load(a_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0)
 
         # Load block from vector B: [BLOCK_K]
-        b_ptrs = B + k_offset * stride_bk
+        b_ptrs = B + k_offset * stride_bk + vector_id * stride_bn
         b = tl.load(b_ptrs, mask=k_mask, other=0.0)
 
         # Accumulate: sum over K dimension
@@ -1213,7 +1262,9 @@ def gemv_kernel(
             acc += tl.sum(a.to(tl.float32) * b.to(tl.float32)[None, :], axis=1)
 
     # Store result
-    c_ptrs = C + row_offset
+    c_ptrs = (
+        C + split_id * partial_stride + row_offset * stride_cm + vector_id * stride_cn
+    )
     acc = acc.to(C.dtype.element_ty)
     tl.store(c_ptrs, acc, mask=row_mask)
 
@@ -1238,7 +1289,110 @@ def gemv_mm(a, b, c, M, K):
             a.stride(0),
             a.stride(1),
             b.stride(0),
+            b.stride(1),
+            c.stride(0),
+            c.stride(1),
+            0,
+            N_VECTORS=1,
             IS_FP64=a.dtype == torch.float64,
+        )
+    return c
+
+
+def _splitk_gemv_runtime_eligible(a, b, c, K):
+    return (
+        K >= 16384
+        and a.dtype == b.dtype == c.dtype == torch.bfloat16
+        and a.is_cuda
+        and b.is_cuda
+        and c.is_cuda
+        and a.device == b.device == c.device
+        and a.is_contiguous()
+        and (b.is_contiguous() or b.T.is_contiguous())
+        and c.is_contiguous()
+    )
+
+
+def _splitk_gemv_scenario(a, b, c, M, N, K):
+    return (
+        M == 1
+        and 1 < N <= 4
+        and tuple(c.shape) == (M, N)
+        and _splitk_gemv_runtime_eligible(a, b, c, K)
+    )
+
+
+def _batched_splitk_gemv_scenario(a, b, c, M, N, K):
+    return (
+        1 < M
+        and 1 < N <= 4
+        and M * N <= 16 * _get_sm_count_for_tensor(a)
+        and tuple(c.shape) == (M, N)
+        and _splitk_gemv_runtime_eligible(a, b, c, K)
+    )
+
+
+def splitk_gemv_mm(a, b, c, M, N, K):
+    if M == 1:
+        matrix = b.T
+        vectors = a[0]
+        output_rows = N
+        output_vectors = 1
+        if matrix.is_contiguous():
+            block_m, block_k, split_k, num_warps = 1, 128, 32, 1
+        else:
+            block_m, block_k, split_k, num_warps = 4, 256, 64, 4
+    else:
+        matrix = a
+        vectors = b
+        output_rows = M
+        output_vectors = N
+        block_k = 256
+        if M <= 16:
+            block_m, split_k, num_warps = 16, 32, 4
+        elif M <= 96:
+            block_m, split_k, num_warps = 8, 16, 2
+        else:
+            block_m, split_k, num_warps = 32, 16, 2
+
+    partials = torch.empty(
+        (split_k, output_rows, output_vectors),
+        device=a.device,
+        dtype=torch.float32,
+    )
+    raw_gemv_kernel = gemv_kernel.fn.fn
+    with torch_device_fn.device(a.device):
+        raw_gemv_kernel[(triton.cdiv(output_rows, block_m), split_k, output_vectors)](
+            matrix,
+            vectors,
+            partials,
+            output_rows,
+            K,
+            matrix.stride(0),
+            matrix.stride(1),
+            vectors.stride(0),
+            0 if vectors.ndim == 1 else vectors.stride(1),
+            partials.stride(1),
+            partials.stride(2),
+            partials.stride(0),
+            BLOCK_M=block_m,
+            BLOCK_K=block_k,
+            N_VECTORS=output_vectors,
+            SPLIT_K=split_k,
+            IS_FP64=False,
+            num_warps=num_warps,
+            num_stages=1,
+        )
+        n_elements = M * N
+        reduce_block = 32 if M == 1 else 256
+        mm_kernel_tma_splitk_reduce[(triton.cdiv(n_elements, reduce_block),)](
+            partials,
+            c,
+            n_elements,
+            partials.stride(0),
+            SPLIT_K=split_k,
+            BLOCK_SIZE=reduce_block,
+            num_warps=1 if M == 1 else 4,
         )
     return c
 
@@ -1380,7 +1534,10 @@ def splitk_scenario(a, b, M, N, K):
     output_ctas = triton.cdiv(M, 16) * triton.cdiv(N, 32)
     sm_count = min(_get_sm_count_for_tensor(a), _H20_SM_COUNT)
     cta_limit = sm_count // 2
-    if K >= 6144 and not b.is_contiguous() and b.T.is_contiguous():
+    if K >= 6144 and (
+        (not b.is_contiguous() and b.T.is_contiguous())
+        or (b.is_contiguous() and a.dtype == b.dtype == torch.bfloat16)
+    ):
         cta_limit = 3 * sm_count // 4
     return output_ctas <= cta_limit
 
@@ -1396,20 +1553,35 @@ _WS_TILES = {
 
 def _select_warp_specialized_plan(M, N, K):
     k_tiles = (K + 127) // 128
-    k_depth_matches = not K % 128 and 12 <= k_tiles <= 20
-    if k_depth_matches:
+    aligned_k = not K % 128
+    medium_k = aligned_k and 12 <= k_tiles <= 20
+    deep_k = aligned_k and 32 <= k_tiles <= 64
+    if medium_k or deep_k:
         n_ctas_128 = (N + 127) // 128
-        if _H20_NEAR_WAVE_MIN_CTAS <= n_ctas_128 <= _H20_SM_COUNT:
-            if 72 <= M <= 96:
+        if medium_k:
+            if (65 <= M <= 80 or 97 <= M <= 104) and n_ctas_128 >= 8 * _H20_SM_COUNT:
                 return _WS_PLAN_SPLIT_M
+            if _H20_NEAR_WAVE_MIN_CTAS <= n_ctas_128 <= _H20_SM_COUNT:
+                if 72 <= M <= 96:
+                    return _WS_PLAN_SPLIT_M
 
         n_ctas_160 = (N + 159) // 160
-        if (
-            72 <= M <= 96
-            and _H20_NEAR_WAVE_MIN_CTAS <= n_ctas_160 <= _H20_SM_COUNT
-            and n_ctas_128 > _H20_SM_COUNT
-        ):
-            return _WS_PLAN_FRAGMENTED_N
+        if medium_k:
+            if (
+                72 <= M <= 96
+                and _H20_NEAR_WAVE_MIN_CTAS <= n_ctas_160 <= _H20_SM_COUNT
+                and n_ctas_128 > _H20_SM_COUNT
+            ):
+                return _WS_PLAN_FRAGMENTED_N
+        elif 65 <= M <= 104:
+            if _H20_SM_COUNT < n_ctas_128 <= 2 * _H20_SM_COUNT:
+                return _WS_PLAN_SPLIT_M
+            if (
+                M <= 72
+                and _H20_SM_COUNT < n_ctas_160 <= 2 * _H20_SM_COUNT
+                and n_ctas_128 > 2 * _H20_SM_COUNT
+            ):
+                return _WS_PLAN_FRAGMENTED_N
     return None
 
 
@@ -1610,6 +1782,73 @@ if HAS_TLE_WARP_SPECIALIZATION:
         else:
             tl.static_assert(BLOCK_M == 128)
             tl.static_assert(M > 64 and M <= BLOCK_M)
+            split_tail: tl.constexpr = M > 96 and M <= 112
+            if split_tail:
+                tl.static_assert(not fragmented)
+                if M <= 104:
+                    final_tail_m: tl.constexpr = 8
+                else:
+                    final_tail_m: tl.constexpr = 16
+                acc_tail_32_t = tl.zeros((128, 32), dtype=tl.float32)
+                acc_final_tail_t = tl.zeros((128, final_tail_m), dtype=tl.float32)
+                for k_block_idx in range(0, K // BLOCK_K):
+                    index = k_block_idx % num_stages
+                    phase = k_block_idx // num_stages
+                    tle_exp.gpu.barrier_wait(full_a[index], phaseIdx=phase)
+                    tle_exp.gpu.barrier_wait(full_b[index], phaseIdx=phase)
+                    a_tail_32 = _warp_specialized_smem_subslice(
+                        a_smem.slot(index), [64, 0], [32, BLOCK_K]
+                    )
+                    a_final_tail = _warp_specialized_smem_subslice(
+                        a_smem.slot(index), [96, 0], [final_tail_m, BLOCK_K]
+                    )
+                    b_128 = b_smem.slot(index)
+                    acc_tail_32_t = tle_exp.gpu.wgmma(
+                        b_128,
+                        a_tail_32,
+                        acc_tail_32_t,
+                        out_dtype=tl.float32,
+                        trans_a=B_ROW_MAJOR,
+                        trans_b=True,
+                    )
+                    acc_final_tail_t = tle_exp.gpu.wgmma(
+                        b_128,
+                        a_final_tail,
+                        acc_final_tail_t,
+                        out_dtype=tl.float32,
+                        trans_a=B_ROW_MAJOR,
+                        trans_b=True,
+                    )
+                    acc_tail_32_t = tle_exp.gpu.wgmma_wait(0, acc_tail_32_t)
+                    acc_final_tail_t = tle_exp.gpu.wgmma_wait(0, acc_final_tail_t)
+                    tle_exp.gpu.barrier_arrive(empty_a[index], phaseIdx=phase)
+                    tle_exp.gpu.barrier_arrive(empty_b[index], phaseIdx=phase)
+
+                n_128 = tile_n_start + tl.arange(0, 128)
+                tail_32_rows = pid_m * BLOCK_M + 64 + tl.arange(0, 32)
+                tail_32_ptrs = (
+                    c_ptr
+                    + tail_32_rows[:, None] * stride_cm
+                    + n_128[None, :] * stride_cn
+                )
+                tail_32_mask = (tail_32_rows[:, None] < M) & (n_128[None, :] < N)
+                tl.store(
+                    tail_32_ptrs,
+                    tl.trans(acc_tail_32_t).to(c_ptr.dtype.element_ty),
+                    mask=tail_32_mask,
+                )
+                final_tail_rows = pid_m * BLOCK_M + 96 + tl.arange(0, final_tail_m)
+                final_tail_ptrs = (
+                    c_ptr
+                    + final_tail_rows[:, None] * stride_cm
+                    + n_128[None, :] * stride_cn
+                )
+                final_tail_mask = (final_tail_rows[:, None] < M) & (n_128[None, :] < N)
+                tl.store(
+                    final_tail_ptrs,
+                    tl.trans(acc_final_tail_t).to(c_ptr.dtype.element_ty),
+                    mask=final_tail_mask,
+                )
             if M <= 72:
                 tail_m: tl.constexpr = 8
             elif M <= 80:
@@ -1621,7 +1860,7 @@ if HAS_TLE_WARP_SPECIALIZATION:
             acc_128_t = tl.zeros((128, tail_m), dtype=tl.float32)
             if fragmented:
                 acc_64_t = tl.zeros((64, tail_m), dtype=tl.float32)
-            for k_block_idx in range(0, K // BLOCK_K):
+            for k_block_idx in range(0, 0 if split_tail else K // BLOCK_K):
                 index = k_block_idx % num_stages
                 phase = k_block_idx // num_stages
                 tle_exp.gpu.barrier_wait(full_a[index], phaseIdx=phase)
@@ -1672,7 +1911,7 @@ if HAS_TLE_WARP_SPECIALIZATION:
             offs_m = pid_m * BLOCK_M + 64 + tl.arange(0, tail_m)
             n_128 = tile_n_start + tl.arange(0, 128)
             ptrs_128 = c_ptr + offs_m[:, None] * stride_cm + n_128[None, :] * stride_cn
-            mask_128 = (offs_m[:, None] < M) & (n_128[None, :] < N)
+            mask_128 = (offs_m[:, None] < M) & (n_128[None, :] < N) & (not split_tail)
             tl.store(
                 ptrs_128,
                 tl.trans(acc_128_t).to(c_ptr.dtype.element_ty),
@@ -1946,7 +2185,7 @@ def _warp_specialized_mm_runtime_eligible(a, b, c, M, N, K):
         and _is_tma_descriptor_aligned(a)
         and _is_tma_descriptor_aligned(b, allow_transpose=True)
         and _is_tma_descriptor_aligned(c)
-        and N % 64 == 0
+        and N % 32 == 0
         and K % 128 == 0
     )
     if not eligible:
@@ -2291,6 +2530,10 @@ def mm(a, b):
     # Optimize for N=1 case (matrix-vector multiplication)
     if N == 1:
         return gemv_mm(a, b, c, M, K)
+    if _splitk_gemv_scenario(a, b, c, M, N, K) or _batched_splitk_gemv_scenario(
+        a, b, c, M, N, K
+    ):
+        return splitk_gemv_mm(a, b, c, M, N, K)
     # l2_cache_size = get_l2_cache_size()
     ws_plan = _select_warp_specialized_dispatch_plan(a, b, c, M, N, K)
     if ws_plan is not None:
@@ -2327,6 +2570,10 @@ def mm_out(a, b, *, out):
     # Optimize for N=1 case (matrix-vector multiplication)
     if N == 1:
         return gemv_mm(a, b, out, M, K)
+    if _splitk_gemv_scenario(a, b, out, M, N, K) or _batched_splitk_gemv_scenario(
+        a, b, out, M, N, K
+    ):
+        return splitk_gemv_mm(a, b, out, M, N, K)
     # l2_cache_size = get_l2_cache_size()
     ws_plan = _select_warp_specialized_dispatch_plan(a, b, out, M, N, K)
     if ws_plan is not None:
