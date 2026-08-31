@@ -203,12 +203,33 @@ mm_tma_transposed_direct:
     num_stages: 3
     num_warps: 4
   - META:
+      BLOCK_M: 16
+      BLOCK_N: 64
+      BLOCK_K: 256
+      N_MAJOR: true
+    num_stages: 3
+    num_warps: 4
+  - META:
       BLOCK_M: 32
       BLOCK_N: 64
       BLOCK_K: 64
       N_MAJOR: true
     num_stages: 3
     num_warps: 4
+  - META:
+      BLOCK_M: 32
+      BLOCK_N: 128
+      BLOCK_K: 64
+      N_MAJOR: true
+    num_stages: 3
+    num_warps: 4
+  - META:
+      BLOCK_M: 64
+      BLOCK_N: 128
+      BLOCK_K: 64
+      N_MAJOR: true
+    num_stages: 3
+    num_warps: 8
   - META:
       BLOCK_M: 16
       BLOCK_N: 64

@@ -700,6 +700,7 @@ def mm_kernel_tma_transposed_direct(
     M,
     N,
     K,
+    stride_bk,
     stride_cm,
     stride_cn,
     BLOCK_M: tl.constexpr,
@@ -788,7 +789,7 @@ class _TmaTransposedStableTuner(LibTuner):
 mm_kernel_tma_transposed_direct_tuned = libentry()(
     libtuner(
         configs=_get_tma_transposed_direct_tuned_configs(),
-        key=["M", "N", "K", "B_ROW_MAJOR"],
+        key=["M", "N", "K", "stride_bk"],
         strategy=["default", "default", "default", "default"],
         policy=_TmaTransposedStableTuner,
         warmup=10,
@@ -1109,6 +1110,7 @@ def tma_transposed_direct_tuned_mm(a, b, c, M, N, K):
             M,
             N,
             K,
+            b.stride(0),
             c.stride(0),
             c.stride(1),
             B_ROW_MAJOR=b_row_major,
@@ -1994,7 +1996,7 @@ if HAS_TLE_WARP_SPECIALIZATION:
     @libentry()
     @libtuner(
         configs=_get_warp_specialized_mm_configs(),
-        key=["M", "N", "K", "B_ROW_MAJOR"],
+        key=["M", "N", "K", "stride_bk"],
         prune_configs_by={"early_config_prune": _prune_warp_specialized_configs},
         strategy=["default", "default", "default", "default"],
         policy="flagtune",
@@ -2013,6 +2015,7 @@ if HAS_TLE_WARP_SPECIALIZATION:
         M: tl.constexpr,
         N: tl.constexpr,
         K: tl.constexpr,
+        stride_bk,
         stride_cm,
         stride_cn,
         BLOCK_M: tl.constexpr,
@@ -2254,6 +2257,7 @@ def warp_specialized_mm(a, b, c, M, N, K):
             M=M,
             N=N,
             K=K,
+            stride_bk=b.stride(0),
             stride_cm=c.stride(0),
             stride_cn=c.stride(1),
             WS_PLAN=plan,
