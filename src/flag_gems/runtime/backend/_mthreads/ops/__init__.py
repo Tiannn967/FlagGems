@@ -14,6 +14,7 @@
 
 from torch_musa import current_device, get_device_capability
 
+from ._conj import _conj
 from .all import all, all_dim, all_dims
 from .amax import amax
 from .any import any, any_dim, any_dims
@@ -22,7 +23,9 @@ from .argmin import argmin
 from .batch_norm import batch_norm, batch_norm_backward
 from .bucketize import bucketize
 from .celu import celu
+from .channel_shuffle import channel_shuffle
 from .conv2d import conv2d
+from .conv_transpose1d import conv_transpose1d, conv_transpose1d_output_size
 from .div import (
     div_mode,
     div_mode_,
@@ -98,6 +101,7 @@ from .zeros import zero_, zeros
 from .zeros_like import zeros_like
 
 __all__ = [
+    "_conj",
     "amax",
     "all",
     "all_dim",
@@ -113,7 +117,10 @@ __all__ = [
     "bucketize",
     "celu",
     # "celu_",
+    "channel_shuffle",
     "conv2d",
+    "conv_transpose1d",
+    "conv_transpose1d_output_size",
     "dropout",
     "dropout_backward",
     "erfinv",
